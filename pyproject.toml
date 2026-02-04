@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mr_kyutai"
+version = "0.1.0"
+description = "Kyutai streaming TTS plugin for MindRoot (drop-in replacement for mr_eleven_stream)"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "python-dotenv",
+  "websockets",
+  "msgpack"
+]
+
+[project.optional-dependencies]
+local = [
+  "moshi>=0.2.11",
+  "torch"
+]
+dev = [
+  "pytest",
+  "pytest-asyncio"
+]

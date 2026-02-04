@@ -1,0 +1,38 @@
+{
+  "name": "Kyutai Streaming TTS",
+  "version": "0.1.0",
+  "description": "Drop-in replacement for mr_eleven_stream using Kyutai TTS (moshi) with realtime incremental input + SIP ulaw_8k output",
+  "author": "MindRoot",
+  "dependencies": [],
+  "services": [
+    "stream_tts"
+  ],
+  "commands": [
+    "speak"
+  ],
+  "pipes": [
+    "partial_command"
+  ],
+  "env_vars": {
+    "MR_KYUTAI_HF_REPO": {
+      "description": "HuggingFace repo for TTS model",
+      "default": "kyutai/tts-1.6b-en_fr"
+    },
+    "MR_KYUTAI_VOICE": {
+      "description": "Voice file path relative to voice repo",
+      "default": "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+    },
+    "MR_KYUTAI_DEVICE": {
+      "description": "Device for inference (cuda/cpu)",
+      "default": "cuda"
+    },
+    "MR_KYUTAI_REALTIME_STREAM": {
+      "description": "Enable realtime streaming mode",
+      "default": "0"
+    }
+  },
+  "persona_fields": {
+    "voice_id": "Absolute path to reference audio file (3-10 seconds of speech)",
+    "voice_ref_text": "Transcript of the reference audio"
+  }
+}

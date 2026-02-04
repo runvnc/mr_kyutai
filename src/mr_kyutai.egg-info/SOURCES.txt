@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+setup.py
+src/mr_kyutai/__init__.py
+src/mr_kyutai/audio_pacer.py
+src/mr_kyutai/realtime_stream.py
+src/mr_kyutai/remote_server.py
+src/mr_kyutai.egg-info/PKG-INFO
+src/mr_kyutai.egg-info/SOURCES.txt
+src/mr_kyutai.egg-info/dependency_links.txt
+src/mr_kyutai.egg-info/requires.txt
+src/mr_kyutai.egg-info/top_level.txt

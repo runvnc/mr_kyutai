@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: mr_kyutai
+Version: 0.1.0
+Summary: Kyutai streaming TTS plugin for MindRoot (drop-in replacement for mr_eleven_stream)
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: python-dotenv
+Requires-Dist: websockets
+Requires-Dist: msgpack
+Provides-Extra: local
+Requires-Dist: moshi>=0.2.11; extra == "local"
+Requires-Dist: torch; extra == "local"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"
+Dynamic: requires-python

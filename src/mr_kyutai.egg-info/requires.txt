@@ -1,0 +1,12 @@
+numpy
+python-dotenv
+websockets
+msgpack
+
+[dev]
+pytest
+pytest-asyncio
+
+[local]
+moshi>=0.2.11
+torch
