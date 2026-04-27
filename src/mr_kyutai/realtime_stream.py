@@ -648,10 +648,17 @@ class RealtimeSpeakSession:
             self._audio_queue.put(_END)
 
     async def _process_audio(self):
+        sip_response_started = False
         try:
             sip_available = service_manager.functions.get("sip_audio_out_chunk") is not None
 
             if sip_available:
+                try:
+                    sip_response_started = await service_manager.sip_start_audio_response(context=self.context)
+                    logger.debug(f"mr_kyutai SIP audio response start={sip_response_started}")
+                except Exception as e:
+                    logger.debug(f"mr_kyutai SIP audio response start unavailable: {e}")
+
                 self._pacer = AudioPacer(sample_rate=8000)
 
                 async def send_to_sip(chunk, timestamp=None, context=None):
@@ -685,6 +692,13 @@ class RealtimeSpeakSession:
 
         except Exception as e:
             logger.exception(f"mr_kyutai audio processor error: {e}")
+        finally:
+            if sip_response_started:
+                try:
+                    ended = await service_manager.sip_end_audio_response(context=self.context)
+                    logger.debug(f"mr_kyutai SIP audio response end={ended}")
+                except Exception as e:
+                    logger.warning(f"mr_kyutai failed to end SIP audio response: {e}")
 
     async def start(self):
         if self.is_active:
