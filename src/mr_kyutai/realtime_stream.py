@@ -26,6 +26,7 @@ import asyncio
 import logging
 import threading
 import queue
+import traceback
 import re
 import audioop
 import socket
@@ -44,7 +45,28 @@ from .audio_pacer import AudioPacer
 
 logger = logging.getLogger(__name__)
 
+# File logger for /workspace/kyutai.err
+_file_logger = None
+try:
+    _fh = logging.FileHandler('/workspace/kyutai.err', mode='a')
+    _fh.setLevel(logging.DEBUG)
+    _fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    _file_logger = logging.getLogger('mr_kyutai.realtime')
+    _file_logger.addHandler(_fh)
+    _file_logger.setLevel(logging.DEBUG)
+    _file_logger.propagate = True
+except Exception:
+    pass
+
+def _klog(msg: str):
+    """Log to both standard logger and /workspace/kyutai.err."""
+    logger.info(msg)
+    if _file_logger:
+        _file_logger.info(msg)
+
 _END = object()
+
+_klog('mr_kyutai realtime_stream.py MODULE LOADED')
 
 def _require_local_tts_deps():
     """
@@ -559,6 +581,7 @@ class RealtimeSpeakSession:
     def _run_tts_thread(self):
         try:
             if _is_remote_enabled():
+                _klog(f"mr_kyutai: KYUTAI_REMOTE={os.environ.get('KYUTAI_REMOTE','')}, using remote TTS")
                 logger.info("mr_kyutai: KYUTAI_REMOTE set, using remote TTS")
                 self._run_remote_tts()
                 return
@@ -567,6 +590,7 @@ class RealtimeSpeakSession:
 
             voice_repo = os.environ.get("MR_KYUTAI_VOICE_REPO", "kyutai/tts-voices")
             voice_rel = self._get_effective_voice_rel()
+            _klog(f"mr_kyutai: local mode, voice_rel={voice_rel}")
 
             # Kyutai voice conditioning: for multi_speaker, pass list of voices, else []
             if tts_model.multi_speaker:
@@ -702,6 +726,7 @@ class RealtimeSpeakSession:
 
     async def start(self):
         if self.is_active:
+            _klog(f"mr_kyutai session.start: already active, skipping")
             return
         self.is_active = True
         self.is_finished = False
@@ -709,12 +734,14 @@ class RealtimeSpeakSession:
         self._buffer = ""
 
         self._tts_thread = threading.Thread(target=self._run_tts_thread, daemon=True)
+        _klog(f"mr_kyutai session.start: starting TTS thread, remote={_is_remote_enabled()}, KYUTAI_REMOTE={os.environ.get('KYUTAI_REMOTE','')}")
         self._tts_thread.start()
         self._audio_task = asyncio.create_task(self._process_audio())
 
     async def feed_text_delta(self, delta: str):
         if not self.is_active or self.is_finished:
             return
+        _klog(f"mr_kyutai feed_text_delta: delta={repr(delta[:80])}")
         # Buffer until word boundary.
         chunks = self._split_word_complete(delta)
         for ch in chunks:
@@ -782,7 +809,7 @@ async def cleanup_session(log_id: str):
 @pipe(name="partial_command", priority=10)
 async def handle_speak_partial(data: dict, context=None) -> dict:
     """Intercept partial speak(text=...) and stream deltas into Kyutai realtime session."""
-    logger.info(f"KYUTAI_PIPE: partial_command called command={data.get('command')} enabled={is_realtime_streaming_enabled()}")
+    _klog(f"KYUTAI_PIPE: partial_command called command={data.get('command')} enabled={is_realtime_streaming_enabled()}")
     if not is_realtime_streaming_enabled():
         return data
 
@@ -790,7 +817,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
         return data
 
     log_id = getattr(context, "log_id", None) if context else None
-    logger.info(f"KYUTAI_PIPE: speak detected log_id={log_id} text_len={len(data.get('params', {}).get('text', ''))}")
+    _klog(f"KYUTAI_PIPE: speak detected log_id={log_id} text_len={len(data.get('params', {}).get('text', ''))}")
     if not log_id:
         return data
 
@@ -799,7 +826,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     if not new_text:
         return data
 
-    logger.info(f"KYUTAI_PIPE: creating/using session for log_id={log_id}")
+    _klog(f"KYUTAI_PIPE: creating/using session for log_id={log_id}")
     if log_id not in _realtime_sessions:
         s = RealtimeSpeakSession(context=context)
         _realtime_sessions[log_id] = s

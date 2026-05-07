@@ -28,7 +28,7 @@
     },
     "MR_KYUTAI_REALTIME_STREAM": {
       "description": "Enable realtime streaming mode",
-      "default": "0"
+      "default": "1"
     }
   },
   "persona_fields": {
