@@ -791,7 +791,7 @@ async def speak(
     sip_response_started = False
 
     try:
-        _speak_debug(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
+        print(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
 
  
 
