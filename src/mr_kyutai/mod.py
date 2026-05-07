@@ -14,7 +14,6 @@ async def speak(
         log_id = context.log_id
     sip_response_started = False
 
-    try:
-        print(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
+    print(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
 
 print("OK")
