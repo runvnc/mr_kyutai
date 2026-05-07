@@ -1,2 +1,2 @@
 # MindRoot plugin package
-from .mod import speak
+from .mod import *

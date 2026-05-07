@@ -1,3 +1,5 @@
+print("Loading Kyutai")
+
 from lib.providers.commands import command
 
 @command()
@@ -15,4 +17,4 @@ async def speak(
     try:
         print(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
 
-
+print("OK")
