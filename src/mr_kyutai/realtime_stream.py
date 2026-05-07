@@ -39,6 +39,7 @@ import numpy as np
 
 from lib.pipelines.pipe import pipe
 from lib.providers.services import service_manager
+from lib.providers.commands import command
 
 from .audio_pacer import AudioPacer
 
@@ -776,6 +777,23 @@ async def cleanup_session(log_id: str):
             await s.cancel()
         del _realtime_sessions[log_id]
 
+
+@command()
+async def speak(
+    text: str,
+    voice_id: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """Convert text to speech using Kyutai streaming."""
+    log_id = None
+    if context and hasattr(context, 'log_id'):
+        log_id = context.log_id
+    sip_response_started = False
+
+    try:
+        _speak_debug(f"speak() CALLED text='{text[:60]}...' log_id={log_id}")
+
+ 
 
 @pipe(name="partial_command", priority=10)
 async def handle_speak_partial(data: dict, context=None) -> dict:
