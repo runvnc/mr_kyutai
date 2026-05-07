@@ -782,6 +782,7 @@ async def cleanup_session(log_id: str):
 @pipe(name="partial_command", priority=10)
 async def handle_speak_partial(data: dict, context=None) -> dict:
     """Intercept partial speak(text=...) and stream deltas into Kyutai realtime session."""
+    logger.info(f"KYUTAI_PIPE: partial_command called command={data.get('command')} enabled={is_realtime_streaming_enabled()}")
     if not is_realtime_streaming_enabled():
         return data
 
@@ -789,6 +790,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
         return data
 
     log_id = getattr(context, "log_id", None) if context else None
+    logger.info(f"KYUTAI_PIPE: speak detected log_id={log_id} text_len={len(data.get('params', {}).get('text', ''))}")
     if not log_id:
         return data
 
@@ -797,6 +799,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     if not new_text:
         return data
 
+    logger.info(f"KYUTAI_PIPE: creating/using session for log_id={log_id}")
     if log_id not in _realtime_sessions:
         s = RealtimeSpeakSession(context=context)
         _realtime_sessions[log_id] = s
