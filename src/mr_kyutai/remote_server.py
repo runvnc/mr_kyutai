@@ -51,6 +51,9 @@ from moshi.models.lm import LMGen
 
 logger = logging.getLogger(__name__)
 
+# Global lock to serialize model access (moshi doesn't support concurrent streaming)
+_model_lock = threading.Lock()
+
 _END = object()
 
 
@@ -85,11 +88,25 @@ def _make_null(all_attributes):
     return dropout_all_conditions(all_attributes)
 
 
+def _force_reset_streaming(module):
+    """Recursively clear _streaming_state on all sub-modules.
+
+    moshi's streaming context manager sets _streaming_state on each module.
+    If cleanup fails or is incomplete, this forces a full reset so the next
+    session can start fresh.
+    """
+    count = 0
+    for name, child in module.named_modules():
+        if hasattr(child, '_streaming_state') and child._streaming_state is not None:
+            child._streaming_state = None
+            count += 1
+    if count > 0:
+        logger.info(f"_force_reset_streaming: cleared {count} streaming states")
+    return count
+
+
 class _KyutaiGen:
     """Incremental generator adapted from kyutai-labs/delayed-streams-modeling scripts/tts_pytorch_streaming.py."""
-
-    # Global lock to serialize model access (moshi doesn't support concurrent streaming)
-    _model_lock = threading.Lock()
 
     def __init__(self, tts_model: TTSModel, attributes: list[ConditionAttributes], on_frame=None):
         self.tts_model = tts_model
@@ -189,6 +206,9 @@ class _KyutaiGen:
                 logger.warning(f"_KyutaiGen cleanup error: {e}")
             finally:
                 self._lm_streaming_ctx = None
+        # Force-reset any remaining streaming state on the shared model
+        if self.tts_model is not None:
+            _force_reset_streaming(self.tts_model.lm)
 
 
 def _prepare_script_piece(model: TTSModel, script_piece: str, first_turn: bool):
@@ -350,6 +370,9 @@ class _Session:
 
         try:
             # Wait until started or ended
+            # Acquire global lock - only one session can use the model at a time
+            _model_lock.acquire()
+            logger.debug("Session acquired model lock")
             while not self.started and rx_thread.is_alive():
                 try:
                     item = self.text_q.get(timeout=0.05)
@@ -389,6 +412,10 @@ class _Session:
             if self.gen is not None:
                 self.gen.cleanup()
                 self.gen = None
+            # Release model lock
+            if _model_lock.locked():
+                _model_lock.release()
+                logger.debug("Session released model lock")
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except Exception:
