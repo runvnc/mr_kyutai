@@ -861,33 +861,3 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
             s.previous_text = new_text
 
     return data
-
-
-@pipe(name="post_command", priority=10)
-async def handle_speak_finished(data: dict, context=None) -> dict:
-    """Detect when a speak command finishes and flush/finish the Kyutai session."""
-    if not is_realtime_streaming_enabled():
-        return data
-
-    if data.get("command") != "speak":
-        return data
-
-    log_id = getattr(context, "log_id", None) if context else None
-    if not log_id:
-        return data
-
-    s = _realtime_sessions.get(log_id)
-    if s is None or not s.is_active:
-        return data
-
-    _klog(f"KYUTAI_POST_CMD: speak finished for log_id={log_id}, calling finish()")
-    try:
-        await s.finish()
-    except Exception as e:
-        _klog(f"KYUTAI_POST_CMD: finish() error: {e}")
-    finally:
-        # Don't delete session - it will be reused for next speak command
-        # But mark it so next speak creates a fresh TTS thread
-        s.is_active = False
-
-    return data
