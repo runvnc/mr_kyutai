@@ -423,6 +423,7 @@ class RealtimeSpeakSession:
                 loop = asyncio.get_running_loop()
 
                 async def rx_loop():
+                    nonlocal ratecv_state
                     try:
                         async for message_bytes in websocket:
                             msg = msgpack.unpackb(message_bytes)
