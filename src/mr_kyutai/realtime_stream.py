@@ -313,7 +313,7 @@ class RealtimeSpeakSession:
         self.previous_text = ""
 
         self._text_queue: queue.Queue = queue.Queue()
-        self._audio_queue: queue.Queue = queue.Queue()
+        self._audio_queue: asyncio.Queue = None  # created in start() with correct event loop
 
         self._tts_thread: Optional[threading.Thread] = None
         self._audio_task: Optional[asyncio.Task] = None
@@ -323,6 +323,12 @@ class RealtimeSpeakSession:
         self._remote_sock: Optional[socket.socket] = None
 
         self._buffer = ""  # partial-word buffer
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _put_audio(self, item):
+        """Thread-safe put into the asyncio audio queue."""
+        if self._main_loop and self._audio_queue is not None:
+            self._main_loop.call_soon_threadsafe(self._audio_queue.put_nowait, item)
 
     def _split_word_complete(self, delta: str) -> list[str]:
         """Accumulate delta, return list of word-complete chunks to synthesize.
@@ -457,12 +463,12 @@ class RealtimeSpeakSession:
                                 chunk = ulaw[i : i + chunk_size]
                                 if chunk:
                                     chunk_count += 1
-                                    self._audio_queue.put(bytes(chunk))
+                                    self._put_audio(bytes(chunk))
                         _klog(f"mr_kyutai WS rx_loop done: received {chunk_count} audio chunks")
                     except Exception as e:
                         logger.exception(f"mr_kyutai moshi-server rx error: {e}")
                     finally:
-                        self._audio_queue.put(_END)
+                        self._put_audio(_END)
 
                 async def tx_loop():
                     try:
@@ -529,7 +535,7 @@ class RealtimeSpeakSession:
                             for i in range(0, len(payload), chunk_size):
                                 chunk = payload[i : i + chunk_size]
                                 if chunk:
-                                    self._audio_queue.put(chunk)
+                                    self._put_audio(chunk)
                     elif ftype == b"E":
                         break
                     elif ftype == b"X":
@@ -545,7 +551,7 @@ class RealtimeSpeakSession:
             except Exception as e:
                 logger.exception(f"mr_kyutai remote rx error: {e}")
             finally:
-                self._audio_queue.put(_END)
+                self._put_audio(_END)
 
         rx_thread = threading.Thread(target=_rx, daemon=True)
         rx_thread.start()
@@ -640,7 +646,7 @@ class RealtimeSpeakSession:
                 for i in range(0, len(ulaw), chunk_size):
                     chunk = ulaw[i : i + chunk_size]
                     if chunk:
-                        self._audio_queue.put(chunk)
+                        self._put_audio(chunk)
 
             gen = _KyutaiGen(tts_model, [cond], on_frame=on_frame)
 
@@ -672,7 +678,7 @@ class RealtimeSpeakSession:
         except Exception as e:
             logger.exception(f"mr_kyutai realtime TTS thread error: {e}")
         finally:
-            self._audio_queue.put(_END)
+            self._put_audio(_END)
 
     async def _process_audio(self):
         sip_response_started = False
@@ -698,11 +704,7 @@ class RealtimeSpeakSession:
                 await self._pacer.start_pacing(send_to_sip, self.context)
 
             while True:
-                try:
-                    audio_chunk = self._audio_queue.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.01)
-                    continue
+                audio_chunk = await self._audio_queue.get()
 
                 if audio_chunk is _END:
                     _klog(f"_process_audio: got _END after {audio_chunks_processed} chunks")
@@ -745,16 +747,13 @@ class RealtimeSpeakSession:
         self.is_finished = False
         self.previous_text = ""
         self._buffer = ""
+        self._main_loop = asyncio.get_event_loop()
+        self._audio_queue = asyncio.Queue()
 
         # Drain any leftover items from previous session
         while not self._text_queue.empty():
             try:
                 self._text_queue.get_nowait()
-            except queue.Empty:
-                break
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
             except queue.Empty:
                 break
         _klog(f"mr_kyutai session.start: queues drained")
@@ -768,10 +767,10 @@ class RealtimeSpeakSession:
         if not self.is_active or self.is_finished:
             return
         _klog(f"mr_kyutai feed_text_delta: delta={repr(delta[:80])}")
-        # Buffer until word boundary.
-        chunks = self._split_word_complete(delta)
-        for ch in chunks:
-            self._text_queue.put(ch)
+        # Send delta directly without word buffering - let the server handle tokenization.
+        # (word buffering commented out for lower latency)
+        if delta:
+            self._text_queue.put(delta)
 
     async def finish(self):
         if not self.is_active:
