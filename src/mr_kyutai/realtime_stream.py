@@ -824,6 +824,12 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     params = data.get("params", {})
     new_text = params.get("text", "") or ""
     if not new_text:
+        # Empty text signals start of a new speak command - reset previous_text
+        if log_id in _realtime_sessions:
+            s = _realtime_sessions[log_id]
+            if s.previous_text:
+                _klog(f"KYUTAI_PIPE: new speak command (text_len=0), resetting previous_text from {len(s.previous_text)} chars")
+                s.previous_text = ""
         return data
 
     _klog(f"KYUTAI_PIPE: creating/using session for log_id={log_id}")
@@ -833,6 +839,11 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
         await s.start()
 
     s = _realtime_sessions[log_id]
+
+    # Detect new command: if new_text is not a prefix continuation of previous_text, reset
+    if s.previous_text and not new_text.startswith(s.previous_text):
+        _klog(f"KYUTAI_PIPE: text is not a continuation (new={repr(new_text[:40])}, prev={repr(s.previous_text[:40])}), resetting")
+        s.previous_text = ""
 
     # Prefix-diff (same as mr_eleven_stream)
     if len(new_text) > len(s.previous_text):
