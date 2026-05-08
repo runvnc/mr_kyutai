@@ -480,10 +480,9 @@ class RealtimeSpeakSession:
                     except Exception as e:
                         logger.exception(f"mr_kyutai moshi-server tx error: {e}")
                     finally:
-                        try:
-                            await websocket.close()
-                        except Exception:
-                            pass
+                        # Do NOT close websocket here - let rx_loop keep receiving
+                        # audio until the server closes the connection after EOS.
+                        pass
 
                 await asyncio.gather(rx_loop(), tx_loop())
 
