@@ -425,6 +425,7 @@ class RealtimeSpeakSession:
                 async def rx_loop():
                     nonlocal ratecv_state
                     try:
+                        chunk_count = 0
                         async for message_bytes in websocket:
                             msg = msgpack.unpackb(message_bytes)
                             if not isinstance(msg, dict):
@@ -455,7 +456,9 @@ class RealtimeSpeakSession:
                             for i in range(0, len(ulaw), chunk_size):
                                 chunk = ulaw[i : i + chunk_size]
                                 if chunk:
+                                    chunk_count += 1
                                     self._audio_queue.put(bytes(chunk))
+                        _klog(f"mr_kyutai WS rx_loop done: received {chunk_count} audio chunks")
                     except Exception as e:
                         logger.exception(f"mr_kyutai moshi-server rx error: {e}")
                     finally:
@@ -673,6 +676,7 @@ class RealtimeSpeakSession:
 
     async def _process_audio(self):
         sip_response_started = False
+        audio_chunks_processed = 0
         try:
             sip_available = service_manager.functions.get("sip_audio_out_chunk") is not None
 
@@ -680,6 +684,7 @@ class RealtimeSpeakSession:
                 try:
                     sip_response_started = await service_manager.sip_start_audio_response(context=self.context)
                     logger.debug(f"mr_kyutai SIP audio response start={sip_response_started}")
+                    _klog(f"_process_audio: SIP response started={sip_response_started}")
                 except Exception as e:
                     logger.debug(f"mr_kyutai SIP audio response start unavailable: {e}")
 
@@ -700,19 +705,26 @@ class RealtimeSpeakSession:
                     continue
 
                 if audio_chunk is _END:
+                    _klog(f"_process_audio: got _END after {audio_chunks_processed} chunks")
                     break
 
                 if isinstance(audio_chunk, (bytes, bytearray)) and audio_chunk:
                     if sip_available and self._pacer is not None:
+                        audio_chunks_processed += 1
                         await self._pacer.add_chunk(bytes(audio_chunk))
                         if self._pacer.interrupted:
+                            _klog(f"_process_audio: pacer interrupted after {audio_chunks_processed} chunks")
                             break
 
             if sip_available and self._pacer is not None:
+                _klog(f"_process_audio: marking finished, {audio_chunks_processed} chunks sent to pacer, interrupted={self._pacer.interrupted}")
                 self._pacer.mark_finished()
                 if not self._pacer.interrupted:
+                    _klog(f"_process_audio: waiting for pacer to drain...")
                     await self._pacer.wait_until_done()
+                    _klog(f"_process_audio: pacer drained")
                 await self._pacer.stop()
+                _klog(f"_process_audio: pacer stopped")
 
         except Exception as e:
             logger.exception(f"mr_kyutai audio processor error: {e}")
@@ -728,6 +740,7 @@ class RealtimeSpeakSession:
         if self.is_active:
             _klog(f"mr_kyutai session.start: already active, skipping")
             return
+        _klog(f"mr_kyutai session.start: starting new session")
         self.is_active = True
         self.is_finished = False
         self.previous_text = ""
@@ -749,17 +762,23 @@ class RealtimeSpeakSession:
 
     async def finish(self):
         if not self.is_active:
+            _klog(f"mr_kyutai session.finish: not active, skipping")
             return
+        _klog(f"mr_kyutai session.finish: setting is_finished=True, putting _END in text queue")
         self.is_finished = True
         self._text_queue.put(_END)
         if self._tts_thread and self._tts_thread.is_alive():
+            _klog(f"mr_kyutai session.finish: waiting for TTS thread to join...")
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: self._tts_thread.join(timeout=60.0))
+            _klog(f"mr_kyutai session.finish: TTS thread joined")
         if self._audio_task:
             try:
+                _klog(f"mr_kyutai session.finish: waiting for audio task (up to 60s)...")
                 await asyncio.wait_for(self._audio_task, timeout=60.0)
             except Exception:
                 pass
+        _klog(f"mr_kyutai session.finish: done, setting is_active=False")
         self.is_active = False
 
     async def cancel(self):
