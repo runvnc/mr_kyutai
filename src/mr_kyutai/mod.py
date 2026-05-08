@@ -21,6 +21,8 @@ async def speak(
     When this command is called, all partial_command events have already
     been processed, so we call finish() on the session to flush remaining
     text and complete the TTS generation.
+
+    We also feed any remaining text that partial_command may not have delivered yet.
     """
     log_id = None
     if context:
@@ -31,6 +33,18 @@ async def speak(
             from .realtime_stream import _realtime_sessions, _klog
             s = _realtime_sessions.get(log_id)
             if s is not None and s.is_active:
+                # Feed any remaining text that partial_command hasn't delivered yet.
+                # This handles the race where speak() runs before all partials arrive.
+                if text and len(text) > len(s.previous_text):
+                    remaining = text[len(s.previous_text):]
+                    if remaining.strip():
+                        _klog(f"speak() command: feeding remaining text: {repr(remaining[:80])}")
+                        await s.feed_text_delta(remaining)
+                        s.previous_text = text
+                elif text and not text.startswith(s.previous_text):
+                    _klog(f"speak() command: text mismatch, feeding full text: {repr(text[:80])}")
+                    await s.feed_text_delta(text)
+                    s.previous_text = text
                 _klog(f"speak() command: finishing session for log_id={log_id}")
                 await s.finish()
                 _klog(f"speak() command: session finished for log_id={log_id}")
