@@ -746,6 +746,19 @@ class RealtimeSpeakSession:
         self.previous_text = ""
         self._buffer = ""
 
+        # Drain any leftover items from previous session
+        while not self._text_queue.empty():
+            try:
+                self._text_queue.get_nowait()
+            except queue.Empty:
+                break
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        _klog(f"mr_kyutai session.start: queues drained")
+
         self._tts_thread = threading.Thread(target=self._run_tts_thread, daemon=True)
         _klog(f"mr_kyutai session.start: starting TTS thread, remote={_is_remote_enabled()}, KYUTAI_REMOTE={os.environ.get('KYUTAI_REMOTE','')}")
         self._tts_thread.start()
