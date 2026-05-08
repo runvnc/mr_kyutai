@@ -88,6 +88,9 @@ def _make_null(all_attributes):
 class _KyutaiGen:
     """Incremental generator adapted from kyutai-labs/delayed-streams-modeling scripts/tts_pytorch_streaming.py."""
 
+    # Global lock to serialize model access (moshi doesn't support concurrent streaming)
+    _model_lock = threading.Lock()
+
     def __init__(self, tts_model: TTSModel, attributes: list[ConditionAttributes], on_frame=None):
         self.tts_model = tts_model
         self.on_frame = on_frame
@@ -95,6 +98,7 @@ class _KyutaiGen:
         self.offset = 0
         self.state = self.tts_model.machine.new_state([])
 
+        self._lm_streaming_ctx = None
         attrs = attributes
         if tts_model.cfg_coef != 1.0:
             if tts_model.valid_cfg_conditionings:
@@ -142,7 +146,10 @@ class _KyutaiGen:
             cfg_is_masked_until=None,
             cfg_is_no_text=True,
         )
-        self.lm_gen.streaming_forever(1)
+        # Enter streaming context manually so we can exit it on cleanup
+        self._lm_streaming_ctx = self.lm_gen.streaming(1)
+        self._lm_streaming_ctx.__enter__()
+        logger.debug("_KyutaiGen: entered LM streaming context")
 
     def append_entry(self, entry):
         self.state.entries.append(entry)
@@ -170,6 +177,18 @@ class _KyutaiGen:
         self.offset += 1
         if frame is not None and self.on_frame is not None:
             self.on_frame(frame)
+
+
+    def cleanup(self):
+        """Exit the LM streaming context to release model state."""
+        if self._lm_streaming_ctx is not None:
+            try:
+                self._lm_streaming_ctx.__exit__(None, None, None)
+                logger.debug("_KyutaiGen: exited LM streaming context")
+            except Exception as e:
+                logger.warning(f"_KyutaiGen cleanup error: {e}")
+            finally:
+                self._lm_streaming_ctx = None
 
 
 def _prepare_script_piece(model: TTSModel, script_piece: str, first_turn: bool):
@@ -366,6 +385,10 @@ class _Session:
             except Exception:
                 pass
         finally:
+            # Clean up LM streaming state before closing socket
+            if self.gen is not None:
+                self.gen.cleanup()
+                self.gen = None
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except Exception:
