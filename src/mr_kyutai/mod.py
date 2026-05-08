@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any
 
 print("Loading Kyutai")
 
-from lib.providers.commands import command
+from mindroot.lib.providers.commands import command
 
 @command()
 async def speak(
