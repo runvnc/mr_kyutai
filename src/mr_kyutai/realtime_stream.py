@@ -864,6 +864,38 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
         return data
 
     _klog(f"KYUTAI_PIPE: creating/using session for log_id={log_id}")
+    # ------------------------------------------------------------------
+    # NOTE / TODO (barge-in teardown gap) - added during investigation of the
+    # mr_eleven_stream "Speech already in progress" stall. Theory, UNVERIFIED
+    # for kyutai:
+    #
+    # Unlike mr_eleven_stream, this plugin has NO on_interrupt hook and nothing
+    # calls cleanup_session() on barge-in. The RealtimeSpeakSession is persistent
+    # per log_id and owns its own _audio_task. On barge-in the SIP layer halts
+    # audio (halt_audio_out) and the LLM turn is cancelled, but THIS session's
+    # _audio_task is not explicitly cancelled, so it can remain is_active=True
+    # until finish()/its 60s wait.
+    #
+    # Consequence: if a NEW turn's first partials arrive while the previous
+    # session is still is_active, the "reuse" branch below is taken (it only
+    # restarts when NOT is_active), so the new turn's text gets fed into the
+    # still-running old session. That's the kyutai analogue of the eleven_stream
+    # collision - expect garbled/overlapping speech or a wedged session rather
+    # than a hard "already in progress" reject.
+    #
+    # Proposed fix (NOT yet applied): when a new command is detected (empty-text
+    # start, or text that is not a continuation of previous_text) while the
+    # existing session is still is_active, tear the old session down and start a
+    # fresh one instead of feeding into it. Optionally add an on_interrupt @hook
+    # that calls cleanup_session(log_id) to mirror mr_eleven_stream.
+    #
+    # *** LATENCY CONSTRAINT (critical) ***: any such teardown must NOT add
+    # delay to setting up the new sentence. cleanup_session()->cancel() does a
+    # socket shutdown + pacer.stop() + _audio_task.cancel(); do NOT block the
+    # new session's start() on that. Tear down the old session concurrently
+    # (e.g. fire-and-forget / asyncio.create_task) so the fresh session can
+    # begin streaming immediately. Verify TTFA is unchanged before/after.
+    # ------------------------------------------------------------------
     if log_id not in _realtime_sessions:
         s = RealtimeSpeakSession(context=context)
         _realtime_sessions[log_id] = s
