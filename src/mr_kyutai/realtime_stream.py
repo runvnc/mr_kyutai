@@ -19,6 +19,10 @@ Env:
   KYUTAI_REMOTE=wss://host:port  (moshi-server over WebSockets, TLS)
   KYUTAI_REMOTE=tcp://host:port  (explicit: use the included framed-TCP reference server)
   KYUTAI_API_KEY=public_token    (optional; moshi-server auth token if using ws/wss)
+
+  MR_KYUTAI_REALTIME_MIN_WORDS=0  (default: 0 = start streaming immediately on any delta)
+                                  (1+ = buffer until N words OR punctuation is detected)
+                                  (when >0, punctuation like .!? triggers output immediately)
 """
 
 import os
@@ -151,6 +155,16 @@ def is_realtime_streaming_enabled() -> bool:
     # Set MR_KYUTAI_REALTIME_STREAM=0/false/off to disable.
     val = os.environ.get("MR_KYUTAI_REALTIME_STREAM", "1").lower()
     return val in ("1", "true", "yes", "on")
+
+
+def _get_realtime_min_words() -> int:
+    """Get the minimum number of words before starting audio output.
+    0 = immediate (current behavior), 1+ = buffer until N words or punctuation."""
+    val = os.environ.get("MR_KYUTAI_REALTIME_MIN_WORDS", "0").strip()
+    try:
+        return max(0, int(val))
+    except (ValueError, TypeError):
+        return 0
 
 
 def _get_device() -> str:
@@ -325,6 +339,9 @@ class RealtimeSpeakSession:
         self._buffer = ""  # partial-word buffer
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # word-buffering state for min_words mode
+        self._word_buffer: list[str] = []
+
     def _put_audio(self, item):
         """Thread-safe put into the asyncio audio queue."""
         if self._main_loop and self._audio_queue is not None:
@@ -348,6 +365,49 @@ class RealtimeSpeakSession:
         emit = self._buffer[:cut]
         self._buffer = self._buffer[cut:]
         return [emit]
+
+    def _has_punctuation(self, text: str) -> bool:
+        """Check if text contains sentence-ending punctuation."""
+        return bool(re.search(r'[.!?](?:\s|$)', text))
+
+    def _get_word_count(self, text: str) -> int:
+        """Count whitespace-separated words in text."""
+        return len(text.split())
+
+    def _buffer_and_check(self, delta: str) -> Optional[str]:
+        """Buffer text and return it when conditions are met (min_words or punctuation).
+
+        Returns the text to emit, or None if we should keep buffering.
+        """
+        if not delta:
+            return None
+        self._buffer += delta
+
+        min_words = _get_realtime_min_words()
+        if min_words == 0:
+            # Immediate mode: emit everything
+            emit = self._buffer
+            self._buffer = ""
+            return emit
+
+        # Check for punctuation first - always emit on punctuation
+        if self._has_punctuation(self._buffer):
+            # Emit up to and including the punctuation
+            m = re.search(r'[.!?](?:\s|$)', self._buffer)
+            if m:
+                cut = m.end()
+                emit = self._buffer[:cut]
+                self._buffer = self._buffer[cut:]
+                return emit
+
+        # Check word count
+        words = self._buffer.split()
+        if len(words) >= min_words:
+            emit = self._buffer
+            self._buffer = ""
+            return emit
+
+        return None
 
     def _flush_buffer(self) -> Optional[str]:
         s = self._buffer.strip()
@@ -473,6 +533,7 @@ class RealtimeSpeakSession:
                 async def tx_loop():
                     try:
                         while True:
+                            min_words = _get_realtime_min_words()
                             item = await loop.run_in_executor(None, self._text_queue.get)
                             if item is _END:
                                 leftover = self._flush_buffer()
@@ -482,9 +543,19 @@ class RealtimeSpeakSession:
                                 await websocket.send(msgpack.packb({"type": "Eos"}))
                                 break
 
-                            if not isinstance(item, str) or not item.strip():
+                            if not isinstance(item, str):
                                 continue
-                            # Follow Kyutai's example: send per-word Text messages.
+                            
+                            if min_words > 0:
+                                # Buffer and check conditions
+                                emit = self._buffer_and_check(item)
+                                if emit is None:
+                                    continue
+                                # Send the buffered text as a single message
+                                await websocket.send(msgpack.packb({"type": "Text", "text": emit}))
+                                continue
+                            
+                            # Immediate mode: send per-word Text messages (original behavior)
                             for word in item.split():
                                 await websocket.send(msgpack.packb({"type": "Text", "text": word}))
                     except Exception as e:
@@ -559,6 +630,7 @@ class RealtimeSpeakSession:
         # TX loop in this (tts) thread
         try:
             while True:
+                min_words = _get_realtime_min_words()
                 item = self._text_queue.get()
                 if item is _END:
                     leftover = self._flush_buffer()
@@ -571,9 +643,16 @@ class RealtimeSpeakSession:
                     _send_frame(sock, b"J", json.dumps({"op": "finish"}).encode("utf-8"))
                     break
 
-                if not isinstance(item, str) or not item.strip():
+                if not isinstance(item, str):
                     continue
-                _send_frame(sock, b"J", json.dumps({"op": "text", "text": item}).encode("utf-8"))
+                
+                if min_words > 0:
+                    emit = self._buffer_and_check(item)
+                    if emit is None:
+                        continue
+                    _send_frame(sock, b"J", json.dumps({"op": "text", "text": emit}).encode("utf-8"))
+                else:
+                    _send_frame(sock, b"J", json.dumps({"op": "text", "text": item}).encode("utf-8"))
         except Exception as e:
             logger.exception(f"mr_kyutai remote tx error: {e}")
         finally:
@@ -653,6 +732,7 @@ class RealtimeSpeakSession:
             first_turn = True
             with tts_model.mimi.streaming(1):
                 while True:
+                    min_words = _get_realtime_min_words()
                     item = self._text_queue.get()
                     if item is _END:
                         # flush any partial word
@@ -666,7 +746,18 @@ class RealtimeSpeakSession:
                         gen.process_last()
                         break
 
-                    if not isinstance(item, str) or not item.strip():
+                    if not isinstance(item, str):
+                        continue
+
+                    if min_words > 0:
+                        emit = self._buffer_and_check(item)
+                        if emit is None:
+                            continue
+                        entries = _prepare_script_piece(tts_model, emit, first_turn)
+                        first_turn = False
+                        for e in entries:
+                            gen.append_entry(e)
+                            gen.process()
                         continue
 
                     entries = _prepare_script_piece(tts_model, item, first_turn)
@@ -747,6 +838,7 @@ class RealtimeSpeakSession:
         self.is_finished = False
         self.previous_text = ""
         self._buffer = ""
+        self._word_buffer = []
         self._main_loop = asyncio.get_event_loop()
         self._audio_queue = asyncio.Queue()
 
@@ -766,6 +858,7 @@ class RealtimeSpeakSession:
     async def feed_text_delta(self, delta: str):
         if not self.is_active or self.is_finished:
             return
+        _klog(f"mr_kyutai feed_text_delta: delta={repr(delta[:80])}")
         _klog(f"mr_kyutai feed_text_delta: delta={repr(delta[:80])}")
         # Send delta directly without word buffering - let the server handle tokenization.
         # (word buffering commented out for lower latency)
@@ -835,7 +928,7 @@ async def cleanup_session(log_id: str):
         del _realtime_sessions[log_id]
 
 
- 
+
 
 @pipe(name="partial_command", priority=10)
 async def handle_speak_partial(data: dict, context=None) -> dict:
