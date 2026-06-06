@@ -37,6 +37,7 @@ import socket
 import json
 import struct
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
+from datetime import datetime
 
 from typing import Dict, Any, Optional, Iterator
 
@@ -67,6 +68,24 @@ def _klog(msg: str):
     logger.info(msg)
     if _file_logger:
         _file_logger.info(msg)
+
+# End-to-end latency log (shared across mr_sip + PySIP)
+E2E_LATENCY_LOG = '/tmp/sip_e2e_latency.log'
+
+def _e2e_log(event: str, utterance_num: int = 0, **kwargs):
+    """Log an end-to-end latency event with perf_counter timestamp."""
+    now = datetime.now()
+    ts = now.strftime('%Y-%m-%d %H:%M:%S') + f'.{now.microsecond // 1000:03d}'
+    pc = time.perf_counter()
+    extra = ' '.join(f'{k}={v}' for k, v in kwargs.items())
+    line = f'[{ts}] [E2E] {event} perf_counter={pc:.6f} utterance={utterance_num} {extra}'
+    try:
+        with open(E2E_LATENCY_LOG, 'a') as f:
+            f.write(line + '\n')
+            f.flush()
+    except Exception:
+        pass
+    logger.info(f'[E2E] {event} utterance={utterance_num} {extra}')
 
 _END = object()
 
@@ -343,6 +362,7 @@ class RealtimeSpeakSession:
         self._word_buffer: list[str] = []
 
     def _put_audio(self, item):
+        """Thread-safe put into the asyncio audio queue."""
         """Thread-safe put into the asyncio audio queue."""
         if self._main_loop and self._audio_queue is not None:
             self._main_loop.call_soon_threadsafe(self._audio_queue.put_nowait, item)
@@ -774,6 +794,7 @@ class RealtimeSpeakSession:
     async def _process_audio(self):
         sip_response_started = False
         audio_chunks_processed = 0
+        first_audio_logged = False
         try:
             sip_available = service_manager.functions.get("sip_audio_out_chunk") is not None
 
@@ -804,6 +825,12 @@ class RealtimeSpeakSession:
                 if isinstance(audio_chunk, (bytes, bytearray)) and audio_chunk:
                     if sip_available and self._pacer is not None:
                         audio_chunks_processed += 1
+                        if not first_audio_logged:
+                            first_audio_logged = True
+                            _e2e_log('KYUTAI_FIRST_AUDIO_FRAME',
+                                     utterance_num=0,
+                                     since_start_ms=f'{(time.perf_counter() - self._start_pc)*1000:.0f}' if hasattr(self, '_start_pc') else '?')
+                            _e2e_log('KYUTAI_FIRST_CHUNK_SENT', utterance_num=0)
                         await self._pacer.add_chunk(bytes(audio_chunk))
                         if self._pacer.interrupted:
                             _klog(f"_process_audio: pacer interrupted after {audio_chunks_processed} chunks")
@@ -836,6 +863,7 @@ class RealtimeSpeakSession:
         _klog(f"mr_kyutai session.start: starting new session")
         self.is_active = True
         self.is_finished = False
+        self._start_pc = time.perf_counter()
         self.previous_text = ""
         self._buffer = ""
         self._word_buffer = []
@@ -858,6 +886,7 @@ class RealtimeSpeakSession:
     async def feed_text_delta(self, delta: str):
         if not self.is_active or self.is_finished:
             return
+        _klog(f"mr_kyutai feed_text_delta: delta={repr(delta[:80])}")
         _klog(f"mr_kyutai feed_text_delta: delta={repr(delta[:80])}")
         _klog(f"mr_kyutai feed_text_delta: delta={repr(delta[:80])}")
         # Send delta directly without word buffering - let the server handle tokenization.
@@ -935,6 +964,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     """Intercept partial speak(text=...) and stream deltas into Kyutai realtime session."""
     _klog(f"KYUTAI_PIPE: partial_command called command={data.get('command')} enabled={is_realtime_streaming_enabled()}")
     if not is_realtime_streaming_enabled():
+        _klog(f"KYUTAI_PIPE: realtime streaming disabled, skipping")
         return data
 
     if data.get("command") != "speak":
@@ -950,6 +980,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     if not new_text:
         # Empty text signals start of a new speak command - reset previous_text
         if log_id in _realtime_sessions:
+            _klog(f"KYUTAI_PIPE: empty text, resetting session for log_id={log_id}")
             s = _realtime_sessions[log_id]
             if s.previous_text:
                 _klog(f"KYUTAI_PIPE: new speak command (text_len=0), resetting previous_text from {len(s.previous_text)} chars")
@@ -991,6 +1022,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     # ------------------------------------------------------------------
     if log_id not in _realtime_sessions:
         s = RealtimeSpeakSession(context=context)
+        s._e2e_utterance_num = 0
         _realtime_sessions[log_id] = s
         await s.start()
     else:
@@ -1002,6 +1034,14 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
             s._buffer = ""
             await s.start()
 
+    # Log first partial speak for this utterance (LLM TTFS)
+    if not hasattr(s, '_e2e_first_partial_logged') or not s._e2e_first_partial_logged:
+        s._e2e_first_partial_logged = True
+        s._e2e_utterance_num = getattr(s, '_e2e_utterance_num', 0) + 1
+        _e2e_log('LLM_FIRST_PARTIAL_SPEAK', utterance_num=s._e2e_utterance_num,
+                 text_len=len(new_text),
+                 text_preview=new_text[:40])
+
     s = _realtime_sessions[log_id]
 
     # Detect new command: if new_text is not a prefix continuation of previous_text, reset
@@ -1012,6 +1052,12 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     # Prefix-diff (same as mr_eleven_stream)
     if len(new_text) > len(s.previous_text):
         delta = new_text[len(s.previous_text) :]
+        # Log first text delta for this utterance
+        if not hasattr(s, '_e2e_first_delta_logged') or not s._e2e_first_delta_logged:
+            s._e2e_first_delta_logged = True
+            _e2e_log('KYUTAI_FIRST_TEXT_DELTA', utterance_num=s._e2e_utterance_num,
+                     delta_len=len(delta),
+                     delta_preview=delta[:40])
         if delta:
             await s.feed_text_delta(delta)
             s.previous_text = new_text
