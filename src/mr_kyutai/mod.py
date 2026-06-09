@@ -51,6 +51,8 @@ async def speak(
         except ImportError:
             pass
         except Exception as e:
-            logging.getLogger(__name__).warning(f"speak() finish error: {e}")
+            logging.getLogger(__name__).exception(f"speak() finish error: {e}")
+            # Do not silently swallow TTS transport/server failures.
+            raise
 
 print("OK")

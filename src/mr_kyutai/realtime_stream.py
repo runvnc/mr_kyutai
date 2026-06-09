@@ -361,9 +361,22 @@ class RealtimeSpeakSession:
 
         # word-buffering state for min_words mode
         self._word_buffer: list[str] = []
+        self._error: Optional[BaseException] = None
+        self._audio_chunks_processed: int = 0
+
+    def _set_error(self, exc: BaseException | str, where: str) -> None:
+        """Record a hard TTS/session error so speak().finish() cannot fail silently."""
+        if isinstance(exc, BaseException):
+            err = exc
+            msg = f"{type(exc).__name__}: {exc}"
+        else:
+            err = RuntimeError(str(exc))
+            msg = str(exc)
+        self._error = err
+        logger.error(f"mr_kyutai {where}: {msg}")
+        _klog(f"ERROR mr_kyutai {where}: {msg}")
 
     def _put_audio(self, item):
-        """Thread-safe put into the asyncio audio queue."""
         """Thread-safe put into the asyncio audio queue."""
         if self._main_loop and self._audio_queue is not None:
             self._main_loop.call_soon_threadsafe(self._audio_queue.put_nowait, item)
@@ -506,7 +519,25 @@ class RealtimeSpeakSession:
 
         async def _ws_main():
             nonlocal ratecv_state
-            async with websockets.connect(uri, additional_headers=headers) as websocket:
+            _klog(f"mr_kyutai WS connecting to {uri}")
+            connect_kwargs = {
+                "open_timeout": float(os.environ.get("KYUTAI_REMOTE_CONNECT_TIMEOUT", "10")),
+                "close_timeout": float(os.environ.get("KYUTAI_REMOTE_CLOSE_TIMEOUT", "5")),
+            }
+            if headers:
+                # websockets 14/15 uses additional_headers; older releases use
+                # extra_headers.  Try the modern spelling first, then fall back
+                # so this fails loudly only for real connection/server issues.
+                connect_kwargs["additional_headers"] = headers
+            try:
+                websocket_cm = websockets.connect(uri, **connect_kwargs)
+            except TypeError:
+                if "additional_headers" in connect_kwargs:
+                    connect_kwargs["extra_headers"] = connect_kwargs.pop("additional_headers")
+                websocket_cm = websockets.connect(uri, **connect_kwargs)
+
+            async with websocket_cm as websocket:
+                _klog(f"mr_kyutai WS connected to {uri}")
                 loop = asyncio.get_running_loop()
 
                 async def rx_loop():
@@ -514,10 +545,17 @@ class RealtimeSpeakSession:
                     try:
                         chunk_count = 0
                         async for message_bytes in websocket:
-                            msg = msgpack.unpackb(message_bytes)
+                            msg = msgpack.unpackb(message_bytes, raw=False)
                             if not isinstance(msg, dict):
                                 continue
+                            if msg.get("type") == "Error":
+                                message = msg.get("message") or msg.get("error") or repr(msg)
+                                raise RuntimeError(f"Kyutai batch server error: {message}")
+                            if msg.get("type") in ("Ready", "Info"):
+                                _klog(f"mr_kyutai WS server message: {msg}")
+                                continue
                             if msg.get("type") != "Audio":
+                                logger.warning(f"mr_kyutai WS unknown message: {msg}")
                                 continue
                             pcm = np.array(msg.get("pcm", []), dtype=np.float32)
                             if pcm.size == 0:
@@ -547,7 +585,8 @@ class RealtimeSpeakSession:
                                     self._put_audio(bytes(chunk))
                         _klog(f"mr_kyutai WS rx_loop done: received {chunk_count} audio chunks")
                     except Exception as e:
-                        logger.exception(f"mr_kyutai moshi-server rx error: {e}")
+                        self._set_error(e, "moshi-server rx error")
+                        raise
                     finally:
                         self._put_audio(_END)
 
@@ -580,7 +619,8 @@ class RealtimeSpeakSession:
                             for word in item.split():
                                 await websocket.send(msgpack.packb({"type": "Text", "text": word}))
                     except Exception as e:
-                        logger.exception(f"mr_kyutai moshi-server tx error: {e}")
+                        self._set_error(e, "moshi-server tx error")
+                        raise
                     finally:
                         # Do NOT close websocket here - let rx_loop keep receiving
                         # audio until the server closes the connection after EOS.
@@ -636,11 +676,12 @@ class RealtimeSpeakSession:
                             msg = payload.decode("utf-8", errors="replace")
                         except Exception:
                             msg = repr(payload)
-                        logger.error(f"mr_kyutai remote server error: {msg}")
+                        self._set_error(f"remote TCP server error: {msg}", "remote rx error")
                         break
                     else:
                         logger.warning(f"mr_kyutai remote: unknown frame type {ftype!r}")
             except Exception as e:
+                self._set_error(e, "remote rx error")
                 logger.exception(f"mr_kyutai remote rx error: {e}")
             finally:
                 self._put_audio(_END)
@@ -675,6 +716,7 @@ class RealtimeSpeakSession:
                 else:
                     _send_frame(sock, b"J", json.dumps({"op": "text", "text": item}).encode("utf-8"))
         except Exception as e:
+            self._set_error(e, "remote tx error")
             logger.exception(f"mr_kyutai remote tx error: {e}")
         finally:
             try:
@@ -788,6 +830,7 @@ class RealtimeSpeakSession:
                         gen.process()
 
         except Exception as e:
+            self._set_error(e, "realtime TTS thread error")
             logger.exception(f"mr_kyutai realtime TTS thread error: {e}")
         finally:
             self._put_audio(_END)
@@ -826,6 +869,7 @@ class RealtimeSpeakSession:
                 if isinstance(audio_chunk, (bytes, bytearray)) and audio_chunk:
                     if sip_available and self._pacer is not None:
                         audio_chunks_processed += 1
+                        self._audio_chunks_processed = audio_chunks_processed
                         if not first_audio_logged:
                             first_audio_logged = True
                             _e2e_log('KYUTAI_FIRST_AUDIO_FRAME',
@@ -836,6 +880,11 @@ class RealtimeSpeakSession:
                         if self._pacer.interrupted:
                             _klog(f"_process_audio: pacer interrupted after {audio_chunks_processed} chunks")
                             break
+
+            if audio_chunks_processed == 0 and self._error is not None:
+                _klog(f"_process_audio: ended with zero audio chunks due to error: {self._error}")
+            elif audio_chunks_processed == 0 and _is_remote_enabled():
+                self._set_error("remote TTS ended without producing any audio chunks", "audio processor")
 
             if sip_available and self._pacer is not None:
                 _klog(f"_process_audio: marking finished, {audio_chunks_processed} chunks sent to pacer, interrupted={self._pacer.interrupted}")
@@ -868,6 +917,8 @@ class RealtimeSpeakSession:
         self.previous_text = ""
         self._buffer = ""
         self._word_buffer = []
+        self._error = None
+        self._audio_chunks_processed = 0
         self._main_loop = asyncio.get_event_loop()
         self._audio_queue = asyncio.Queue()
 
@@ -911,8 +962,12 @@ class RealtimeSpeakSession:
             try:
                 _klog(f"mr_kyutai session.finish: waiting for audio task (up to 60s)...")
                 await asyncio.wait_for(self._audio_task, timeout=60.0)
-            except Exception:
-                pass
+            except Exception as e:
+                self._set_error(e, "audio task failed or timed out")
+        if self._error is not None:
+            _klog(f"mr_kyutai session.finish: raising stored error after {self._audio_chunks_processed} audio chunks: {self._error}")
+            self.is_active = False
+            raise RuntimeError(f"Kyutai TTS failed: {self._error}") from self._error
         _klog(f"mr_kyutai session.finish: done, setting is_active=False")
         self.is_active = False
 
