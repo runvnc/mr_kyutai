@@ -46,6 +46,7 @@ import numpy as np
 
 from lib.pipelines.pipe import pipe
 from lib.providers.services import service_manager
+from lib.providers.hooks import hook
 
 from .audio_pacer import AudioPacer
 
@@ -975,6 +976,7 @@ class RealtimeSpeakSession:
         self.is_finished = True
         self.is_active = False
         try:
+            _klog("mr_kyutai session.cancel: cancelling session")
             if self._remote_sock is not None:
                 try:
                     self._remote_sock.shutdown(socket.SHUT_RDWR)
@@ -989,11 +991,56 @@ class RealtimeSpeakSession:
             pass
         if self._pacer:
             await self._pacer.stop()
+            _klog("mr_kyutai session.cancel: pacer stopped")
         if self._audio_task:
             self._audio_task.cancel()
+            try:
+                await self._audio_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                _klog(f"mr_kyutai session.cancel: audio task ended with error: {e}")
+        if self._tts_thread and self._tts_thread.is_alive():
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: self._tts_thread.join(timeout=2.0))
+                if self._tts_thread.is_alive():
+                    _klog("mr_kyutai session.cancel: TTS thread still alive after brief join")
+            except Exception as e:
+                _klog(f"mr_kyutai session.cancel: TTS thread join error: {e}")
+        _klog("mr_kyutai session.cancel: done")
 
 
 _realtime_sessions: Dict[str, RealtimeSpeakSession] = {}
+
+# Per-conversation serialization barrier shared by the partial_command pipe and
+# the final speak() command. The final speak() command holds this lock until
+# Kyutai has generated all audio and the AudioPacer has drained it to SIP. A
+# later speak command's partials must wait on this before starting, otherwise
+# [speak, speak] can overlap at the partial-streaming layer even if command
+# execution itself is sequential.
+_speak_serial_locks: Dict[str, asyncio.Lock] = {}
+
+# Recently completed streamed speak command IDs. This prevents a stale/late
+# partial_command event for a speak that has already been finalized from creating
+# a fresh session and replaying old text after cleanup.
+_finished_speak_cmd_ids: Dict[str, set[str]] = {}
+
+
+def get_speak_serial_lock(log_id: str) -> asyncio.Lock:
+    if log_id not in _speak_serial_locks:
+        _speak_serial_locks[log_id] = asyncio.Lock()
+    return _speak_serial_locks[log_id]
+
+
+def mark_speak_cmd_finished(log_id: str, cmd_id: Optional[str]) -> None:
+    if not log_id or not cmd_id:
+        return
+    finished = _finished_speak_cmd_ids.setdefault(log_id, set())
+    finished.add(cmd_id)
+    # Keep this bounded; command IDs are nanoids and only need recent-turn dedupe.
+    if len(finished) > 64:
+        _finished_speak_cmd_ids[log_id] = set(list(finished)[-32:])
 
 
 def get_session(log_id: str) -> Optional[RealtimeSpeakSession]:
@@ -1010,7 +1057,29 @@ async def cleanup_session(log_id: str):
         s = _realtime_sessions[log_id]
         if s.is_active:
             await s.cancel()
+        mark_speak_cmd_finished(log_id, getattr(s, "cmd_id", None))
         del _realtime_sessions[log_id]
+
+
+
+@hook()
+async def on_interrupt(context=None):
+    """Cancel active Kyutai realtime TTS on barge-in/interruption.
+
+    This mirrors mr_eleven_stream's interrupt hook: mr_sip/MindRoot can halt SIP
+    output and cancel the active command, while this hook explicitly tears down
+    Kyutai's realtime session, socket/thread, audio task, and pacer.
+    """
+    log_id = getattr(context, "log_id", None) if context else None
+    if not log_id:
+        _klog("mr_kyutai on_interrupt: no log_id in context")
+        return
+
+    if has_active_session(log_id):
+        _klog(f"mr_kyutai on_interrupt: cleaning up active realtime session log_id={log_id}")
+        await cleanup_session(log_id)
+    else:
+        _klog(f"mr_kyutai on_interrupt: no active realtime session log_id={log_id}")
 
 
 
@@ -1033,6 +1102,18 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
 
     params = data.get("params", {})
     new_text = params.get("text", "") or ""
+    cmd_id = data.get("cmd_id")
+
+    # If this is a late partial for a speak command that has already been fully
+    # drained/cleaned up, ignore it rather than starting a new session and
+    # replaying old text.
+    if cmd_id and cmd_id in _finished_speak_cmd_ids.get(log_id, set()):
+        _klog(f"KYUTAI_PIPE: ignoring stale partial for finished speak cmd_id={cmd_id} log_id={log_id}")
+        return data
+
+    existing_session = _realtime_sessions.get(log_id)
+    existing_cmd_id = getattr(existing_session, "cmd_id", None) if existing_session is not None else None
+
     if not new_text:
         # Empty text signals start of a new speak command - reset previous_text
         if log_id in _realtime_sessions:
@@ -1044,6 +1125,25 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
         return data
 
     _klog(f"KYUTAI_PIPE: creating/using session for log_id={log_id}")
+
+    # If a previous final speak() is currently draining audio, do not allow a
+    # different speak command's partials to start a new Kyutai stream yet. This
+    # gives the required [speak, speak] behavior: sentence 2 starts only after
+    # sentence 1's audio has actually been sent. For late partials belonging to
+    # the same command being finalized, do not wait/feed; final speak() already
+    # feeds any remaining final text before finish().
+    serial_lock = get_speak_serial_lock(log_id)
+    if serial_lock.locked():
+        if existing_cmd_id is not None and cmd_id == existing_cmd_id:
+            _klog(f"KYUTAI_PIPE: ignoring late same-cmd partial while final speak drains cmd_id={cmd_id}")
+            return data
+        _klog(f"KYUTAI_PIPE: waiting for previous speak audio to drain before partializing cmd_id={cmd_id}")
+        async with serial_lock:
+            pass
+        if cmd_id and cmd_id in _finished_speak_cmd_ids.get(log_id, set()):
+            _klog(f"KYUTAI_PIPE: partial became stale while waiting cmd_id={cmd_id}")
+            return data
+
     # ------------------------------------------------------------------
     # NOTE / TODO (barge-in teardown gap) - added during investigation of the
     # mr_eleven_stream "Speech already in progress" stall. Theory, UNVERIFIED
@@ -1079,6 +1179,7 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     if log_id not in _realtime_sessions:
         s = RealtimeSpeakSession(context=context)
         s._e2e_utterance_num = 0
+        s.cmd_id = cmd_id
         _realtime_sessions[log_id] = s
         await s.start()
     else:
@@ -1088,7 +1189,10 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
             s.is_finished = False
             s.previous_text = ""
             s._buffer = ""
+            s.cmd_id = cmd_id
             await s.start()
+        elif getattr(s, "cmd_id", None) is None:
+            s.cmd_id = cmd_id
 
     # Log first partial speak for this utterance (LLM TTFS)
     if not hasattr(s, '_e2e_first_partial_logged') or not s._e2e_first_partial_logged:
