@@ -1,8 +1,9 @@
 from typing import Optional, Dict, Any
 import logging
+from . import xml_stream_pipe  # registers @pipe(name='process_stream')
 
 print("Loading Kyutai")
-
+ 
 from lib.providers.commands import command
 
 @command()
