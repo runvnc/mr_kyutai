@@ -29,7 +29,7 @@ class AudioPacer:
         self._interrupted = False
 
     async def add_chunk(self, audio_bytes: bytes):
-        if self._running:
+        if self._running and not self._interrupted:
             self.buffer.append(audio_bytes)
             if self.audio_start_time is None:
                 self.audio_start_time = time.perf_counter()
@@ -40,6 +40,13 @@ class AudioPacer:
 
     def _set_interrupted(self):
         self._interrupted = True
+
+    def interrupt(self):
+        """Interrupt pacing immediately and discard any buffered audio."""
+        self._interrupted = True
+        self._running = False
+        self._finished_adding = True
+        self.buffer.clear()
 
     def mark_finished(self):
         self._finished_adding = True
@@ -68,6 +75,8 @@ class AudioPacer:
 
     async def _pace_loop(self):
         while self._running:
+            if self._interrupted:
+                break
             if len(self.buffer) > 0:
                 chunk = self.buffer.popleft()
 
@@ -94,6 +103,8 @@ class AudioPacer:
                 sleep_duration = target_time - current_time
                 if sleep_duration > 0:
                     await asyncio.sleep(sleep_duration)
+                    if self._interrupted:
+                        break
             else:
                 if self._finished_adding:
                     break
@@ -112,6 +123,8 @@ class AudioPacer:
         self.buffer.clear()
 
     async def wait_until_done(self):
+        if self._interrupted:
+            return
         if self.pacer_task:
             try:
                 await self.pacer_task

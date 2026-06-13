@@ -364,6 +364,8 @@ class RealtimeSpeakSession:
         self._word_buffer: list[str] = []
         self._error: Optional[BaseException] = None
         self._audio_chunks_processed: int = 0
+        self._cancelled = False
+        self._drain_complete_event: Optional[asyncio.Event] = None
 
     def _set_error(self, exc: BaseException | str, where: str) -> None:
         """Record a hard TTS/session error so speak().finish() cannot fail silently."""
@@ -380,7 +382,46 @@ class RealtimeSpeakSession:
     def _put_audio(self, item):
         """Thread-safe put into the asyncio audio queue."""
         if self._main_loop and self._audio_queue is not None:
-            self._main_loop.call_soon_threadsafe(self._audio_queue.put_nowait, item)
+            try:
+                self._main_loop.call_soon_threadsafe(self._audio_queue.put_nowait, item)
+            except Exception:
+                pass
+
+    def request_cancel(self):
+        """Request immediate cancellation without awaiting slow cleanup.
+
+        This is the barge-in fast path: discard buffered audio, unblock finish()
+        waiters, and poke the worker/audio queues so the old session can wind
+        down in the background without holding up the next response.
+        """
+        self._cancelled = True
+        self.is_finished = True
+        self.is_active = False
+        try:
+            self._text_queue.put(_END)
+        except Exception:
+            pass
+        try:
+            if self._remote_sock is not None:
+                try:
+                    self._remote_sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self._remote_sock.close()
+                except Exception:
+                    pass
+                self._remote_sock = None
+        except Exception:
+            pass
+        try:
+            if self._pacer is not None:
+                self._pacer.interrupt()
+        except Exception:
+            pass
+        if self._drain_complete_event is not None:
+            self._drain_complete_event.set()
+        self._put_audio(_END)
 
     def _split_word_complete(self, delta: str) -> list[str]:
         """Accumulate delta, return list of word-complete chunks to synthesize.
@@ -861,10 +902,17 @@ class RealtimeSpeakSession:
                 await self._pacer.start_pacing(send_to_sip, self.context)
 
             while True:
+                if self._cancelled:
+                    _klog(f"_process_audio: cancelled after {audio_chunks_processed} chunks")
+                    break
                 audio_chunk = await self._audio_queue.get()
 
                 if audio_chunk is _END:
                     _klog(f"_process_audio: got _END after {audio_chunks_processed} chunks")
+                    break
+
+                if self._cancelled:
+                    _klog(f"_process_audio: cancelled after dequeue after {audio_chunks_processed} chunks")
                     break
 
                 if isinstance(audio_chunk, (bytes, bytearray)) and audio_chunk:
@@ -884,13 +932,13 @@ class RealtimeSpeakSession:
 
             if audio_chunks_processed == 0 and self._error is not None:
                 _klog(f"_process_audio: ended with zero audio chunks due to error: {self._error}")
-            elif audio_chunks_processed == 0 and _is_remote_enabled():
+            elif audio_chunks_processed == 0 and _is_remote_enabled() and not self._cancelled:
                 self._set_error("remote TTS ended without producing any audio chunks", "audio processor")
 
             if sip_available and self._pacer is not None:
                 _klog(f"_process_audio: marking finished, {audio_chunks_processed} chunks sent to pacer, interrupted={self._pacer.interrupted}")
                 self._pacer.mark_finished()
-                if not self._pacer.interrupted:
+                if not self._cancelled and not self._pacer.interrupted:
                     _klog(f"_process_audio: waiting for pacer to drain...")
                     await self._pacer.wait_until_done()
                     _klog(f"_process_audio: pacer drained")
@@ -906,6 +954,8 @@ class RealtimeSpeakSession:
                     logger.debug(f"mr_kyutai SIP audio response end={ended}")
                 except Exception as e:
                     logger.warning(f"mr_kyutai failed to end SIP audio response: {e}")
+            if self._drain_complete_event is not None:
+                self._drain_complete_event.set()
 
     async def start(self):
         if self.is_active:
@@ -920,8 +970,10 @@ class RealtimeSpeakSession:
         self._word_buffer = []
         self._error = None
         self._audio_chunks_processed = 0
+        self._cancelled = False
         self._main_loop = asyncio.get_event_loop()
         self._audio_queue = asyncio.Queue()
+        self._drain_complete_event = asyncio.Event()
 
         # Drain any leftover items from previous session
         while not self._text_queue.empty():
@@ -954,17 +1006,39 @@ class RealtimeSpeakSession:
         _klog(f"mr_kyutai session.finish: setting is_finished=True, putting _END in text queue")
         self.is_finished = True
         self._text_queue.put(_END)
-        if self._tts_thread and self._tts_thread.is_alive():
-            _klog(f"mr_kyutai session.finish: waiting for TTS thread to join...")
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: self._tts_thread.join(timeout=60.0))
-            _klog(f"mr_kyutai session.finish: TTS thread joined")
+
+        if self._cancelled:
+            _klog(f"mr_kyutai session.finish: cancelled before drain, returning")
+            self.is_active = False
+            return
+
+        if self._drain_complete_event is not None:
+            try:
+                _klog(f"mr_kyutai session.finish: waiting for audio drain event (up to 60s)...")
+                await asyncio.wait_for(self._drain_complete_event.wait(), timeout=60.0)
+            except asyncio.TimeoutError as e:
+                self._set_error(e, "audio drain timed out")
+
+        if self._cancelled:
+            _klog(f"mr_kyutai session.finish: cancelled during drain, returning")
+            self.is_active = False
+            return
+
         if self._audio_task:
             try:
-                _klog(f"mr_kyutai session.finish: waiting for audio task (up to 60s)...")
-                await asyncio.wait_for(self._audio_task, timeout=60.0)
+                if not self._audio_task.done():
+                    _klog(f"mr_kyutai session.finish: audio task not done after drain event; waiting briefly")
+                    await asyncio.wait_for(self._audio_task, timeout=1.0)
             except Exception as e:
-                self._set_error(e, "audio task failed or timed out")
+                self._set_error(e, "audio task failed after drain")
+
+        if self._tts_thread and self._tts_thread.is_alive():
+            _klog(f"mr_kyutai session.finish: joining TTS thread briefly...")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: self._tts_thread.join(timeout=1.0))
+            if self._tts_thread.is_alive():
+                _klog(f"mr_kyutai session.finish: TTS thread still alive after brief join")
+
         if self._error is not None:
             _klog(f"mr_kyutai session.finish: raising stored error after {self._audio_chunks_processed} audio chunks: {self._error}")
             self.is_active = False
@@ -973,22 +1047,8 @@ class RealtimeSpeakSession:
         self.is_active = False
 
     async def cancel(self):
-        self.is_finished = True
-        self.is_active = False
-        try:
-            _klog("mr_kyutai session.cancel: cancelling session")
-            if self._remote_sock is not None:
-                try:
-                    self._remote_sock.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                self._remote_sock.close()
-        except Exception:
-            pass
-        try:
-            self._text_queue.put(_END)
-        except Exception:
-            pass
+        _klog("mr_kyutai session.cancel: cancelling session")
+        self.request_cancel()
         if self._pacer:
             await self._pacer.stop()
             _klog("mr_kyutai session.cancel: pacer stopped")
@@ -1026,6 +1086,10 @@ _speak_serial_locks: Dict[str, asyncio.Lock] = {}
 # a fresh session and replaying old text after cleanup.
 _finished_speak_cmd_ids: Dict[str, set[str]] = {}
 
+# Explicit barge-in marker set by on_interrupt(). Normal consecutive speak
+# commands still wait on the serial lock; only log_ids in this set bypass it.
+_barge_in_pending: set[str] = set()
+
 
 def get_speak_serial_lock(log_id: str) -> asyncio.Lock:
     if log_id not in _speak_serial_locks:
@@ -1052,13 +1116,39 @@ def has_active_session(log_id: str) -> bool:
     return s is not None and s.is_active
 
 
-async def cleanup_session(log_id: str):
-    if log_id in _realtime_sessions:
-        s = _realtime_sessions[log_id]
-        if s.is_active:
-            await s.cancel()
-        mark_speak_cmd_finished(log_id, getattr(s, "cmd_id", None))
+def mark_barge_in(log_id: str) -> None:
+    if log_id:
+        _barge_in_pending.add(log_id)
+
+
+def is_barge_in_pending(log_id: str) -> bool:
+    return bool(log_id and log_id in _barge_in_pending)
+
+
+def consume_barge_in(log_id: str) -> bool:
+    if log_id in _barge_in_pending:
+        _barge_in_pending.discard(log_id)
+        return True
+    return False
+
+
+async def cleanup_session(log_id: str, session: Optional[RealtimeSpeakSession] = None):
+    s = session or _realtime_sessions.get(log_id)
+    if s is None:
+        return
+    if s.is_active or getattr(s, "_cancelled", False):
+        await s.cancel()
+    mark_speak_cmd_finished(log_id, getattr(s, "cmd_id", None))
+    if _realtime_sessions.get(log_id) is s:
         del _realtime_sessions[log_id]
+
+
+def schedule_cleanup_session(log_id: str, session: RealtimeSpeakSession) -> None:
+    try:
+        asyncio.create_task(cleanup_session(log_id, session=session))
+    except RuntimeError:
+        # No running loop; fall back to best-effort fast cancellation only.
+        session.request_cancel()
 
 
 
@@ -1075,9 +1165,12 @@ async def on_interrupt(context=None):
         _klog("mr_kyutai on_interrupt: no log_id in context")
         return
 
-    if has_active_session(log_id):
-        _klog(f"mr_kyutai on_interrupt: cleaning up active realtime session log_id={log_id}")
-        await cleanup_session(log_id)
+    mark_barge_in(log_id)
+    s = _realtime_sessions.get(log_id)
+    if s is not None:
+        _klog(f"mr_kyutai on_interrupt: request_cancel active realtime session log_id={log_id}")
+        s.request_cancel()
+        schedule_cleanup_session(log_id, s)
     else:
         _klog(f"mr_kyutai on_interrupt: no active realtime session log_id={log_id}")
 
@@ -1133,7 +1226,13 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
     # the same command being finalized, do not wait/feed; final speak() already
     # feeds any remaining final text before finish().
     serial_lock = get_speak_serial_lock(log_id)
-    if serial_lock.locked():
+    barge_in = is_barge_in_pending(log_id)
+    if barge_in and existing_cmd_id is not None and cmd_id == existing_cmd_id:
+        # A stale partial from the interrupted response must not consume the
+        # barge-in marker or create a fresh session for cancelled text.
+        _klog(f"KYUTAI_PIPE: ignoring stale same-cmd partial after barge-in cmd_id={cmd_id} log_id={log_id}")
+        return data
+    if serial_lock.locked() and not barge_in:
         if existing_cmd_id is not None and cmd_id == existing_cmd_id:
             _klog(f"KYUTAI_PIPE: ignoring late same-cmd partial while final speak drains cmd_id={cmd_id}")
             return data
@@ -1143,39 +1242,33 @@ async def handle_speak_partial(data: dict, context=None) -> dict:
         if cmd_id and cmd_id in _finished_speak_cmd_ids.get(log_id, set()):
             _klog(f"KYUTAI_PIPE: partial became stale while waiting cmd_id={cmd_id}")
             return data
+    elif serial_lock.locked() and barge_in:
+        _klog(f"KYUTAI_PIPE: barge-in pending; bypassing serial lock for new cmd_id={cmd_id} log_id={log_id}")
+        old = _realtime_sessions.get(log_id)
+        if old is not None:
+            old.request_cancel()
+            schedule_cleanup_session(log_id, old)
+            if _realtime_sessions.get(log_id) is old:
+                del _realtime_sessions[log_id]
+        consume_barge_in(log_id)
+        existing_session = None
+        existing_cmd_id = None
+    elif barge_in:
+        # Interrupt may arrive before/after the final speak lock is held. Either
+        # way, do not reuse a cancelled old session for the new response.
+        _klog(f"KYUTAI_PIPE: barge-in pending with no locked final speak; starting fresh cmd_id={cmd_id} log_id={log_id}")
+        old = _realtime_sessions.get(log_id)
+        if old is not None:
+            old.request_cancel()
+            schedule_cleanup_session(log_id, old)
+            if _realtime_sessions.get(log_id) is old:
+                del _realtime_sessions[log_id]
+        consume_barge_in(log_id)
+        existing_session = None
+        existing_cmd_id = None
 
-    # ------------------------------------------------------------------
-    # NOTE / TODO (barge-in teardown gap) - added during investigation of the
-    # mr_eleven_stream "Speech already in progress" stall. Theory, UNVERIFIED
-    # for kyutai:
-    #
-    # Unlike mr_eleven_stream, this plugin has NO on_interrupt hook and nothing
-    # calls cleanup_session() on barge-in. The RealtimeSpeakSession is persistent
-    # per log_id and owns its own _audio_task. On barge-in the SIP layer halts
-    # audio (halt_audio_out) and the LLM turn is cancelled, but THIS session's
-    # _audio_task is not explicitly cancelled, so it can remain is_active=True
-    # until finish()/its 60s wait.
-    #
-    # Consequence: if a NEW turn's first partials arrive while the previous
-    # session is still is_active, the "reuse" branch below is taken (it only
-    # restarts when NOT is_active), so the new turn's text gets fed into the
-    # still-running old session. That's the kyutai analogue of the eleven_stream
-    # collision - expect garbled/overlapping speech or a wedged session rather
-    # than a hard "already in progress" reject.
-    #
-    # Proposed fix (NOT yet applied): when a new command is detected (empty-text
-    # start, or text that is not a continuation of previous_text) while the
-    # existing session is still is_active, tear the old session down and start a
-    # fresh one instead of feeding into it. Optionally add an on_interrupt @hook
-    # that calls cleanup_session(log_id) to mirror mr_eleven_stream.
-    #
-    # *** LATENCY CONSTRAINT (critical) ***: any such teardown must NOT add
-    # delay to setting up the new sentence. cleanup_session()->cancel() does a
-    # socket shutdown + pacer.stop() + _audio_task.cancel(); do NOT block the
-    # new session's start() on that. Tear down the old session concurrently
-    # (e.g. fire-and-forget / asyncio.create_task) so the fresh session can
-    # begin streaming immediately. Verify TTFA is unchanged before/after.
-    # ------------------------------------------------------------------
+    # Normal consecutive speak commands serialize on the lock above. An explicit
+    # barge-in skips the wait, cancels the old session, and starts fresh here.
     if log_id not in _realtime_sessions:
         s = RealtimeSpeakSession(context=context)
         s._e2e_utterance_num = 0

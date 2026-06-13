@@ -96,7 +96,7 @@ async def speak(
                 _klog(f"speak() command: finishing session for log_id={log_id}")
                 await s.finish()
                 _klog(f"speak() command: session finished for log_id={log_id}")
-                await cleanup_session(log_id)
+                await cleanup_session(log_id, session=s)
         except ImportError:
             pass
         except Exception as e:
