@@ -151,53 +151,48 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
 
 from lib.xml_docstring_adapter import convert_docstring_json_examples_to_xml
 
-# Per-docstring conversion cache: {original_docstring: converted_docstring}
-_docstring_cache: Dict[str, str] = {}
-_DOCSTRING_CACHE_MAX = 256
+
+# Cache: maps original system message text (minus datetime) to converted text.
+# Avoids re-converting the same docstrings every turn when only the datetime changed.
+_sysmsg_cache: Dict[str, str] = {}
+_SYSMSG_CACHE_MAX = 8
 
 
-def _convert_docstrings(data: Dict[str, Any], context) -> Dict[str, Any]:
-    """Convert command docstrings from JSON examples to XML-ish syntax.
+def _strip_datetime(text: str) -> str:
+    """Strip the datetime line from system message for cache key purposes."""
+    import re
+    return re.sub(r'^~ \d{4}-\d{2}-\d{2}.*$', '', text, flags=re.MULTILINE).strip()
 
-    Only runs when xml_streaming is enabled. Caches per-docstring so we
-    don't re-convert the same docstrings every turn.
+
+@pipe(name='process_system_message', priority=5)
+async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str, Any]:
+    """Convert JSON examples to XML-ish syntax in the system message when xml_streaming is on.
+
+    Takes {'text': system_message}, returns {'text': modified_system_message}.
+    Only runs when xml_streaming is enabled. Fast passthrough otherwise.
+    Caches by message content (minus datetime) to avoid re-converting every turn.
     """
     if not _xml_enabled(context):
         return data
 
-    command_docs = data.get('command_docs')
-    if not command_docs or not isinstance(command_docs, dict):
+    text = data.get('text', '')
+    if not text:
         return data
 
-    global _docstring_cache
-    converted = {}
-    for cmd_name, docstring in command_docs.items():
-        if not isinstance(docstring, str):
-            converted[cmd_name] = docstring
-            continue
-        cached = _docstring_cache.get(docstring)
-        if cached is not None:
-            converted[cmd_name] = cached
-        else:
-            result = convert_docstring_json_examples_to_xml(docstring)
-            _docstring_cache[docstring] = result
-            converted[cmd_name] = result
+    global _sysmsg_cache
+    cache_key = _strip_datetime(text)
+    cached = _sysmsg_cache.get(cache_key)
+    if cached is not None:
+        return {'text': cached}
 
-    # Evict if cache is too large
-    if len(_docstring_cache) > _DOCSTRING_CACHE_MAX:
-        keys = list(_docstring_cache.keys())
-        for k in keys[:_DOCSTRING_CACHE_MAX // 2]:
-            del _docstring_cache[k]
+    converted = convert_docstring_json_examples_to_xml(text)
 
-    data['command_docs'] = converted
-    return data
+    # Cache the result
+    _sysmsg_cache[cache_key] = converted
+    if len(_sysmsg_cache) > _SYSMSG_CACHE_MAX:
+        keys = list(_sysmsg_cache.keys())
+        for k in keys[:_SYSMSG_CACHE_MAX // 2]:
+           del _sysmsg_cache[k]
 
-
-@pipe(name='process_system_data', priority=5)
-async def process_system_data(data: Dict[str, Any], context=None) -> Dict[str, Any]:
-    """Convert command docstrings from JSON to XML-ish syntax when xml_streaming is on.
-
-    Takes the data dict passed to the system template, returns modified data.
-    Caches per-docstring so conversion only runs once per unique docstring.
-    """
-    return _convert_docstrings(data, context)
+    return {'text': converted}
+ 
