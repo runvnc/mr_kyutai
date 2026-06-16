@@ -18,6 +18,7 @@ No side effects: all output is text (JSON arrays) that the parser handles.
 import json
 import os
 from typing import Any, Dict
+import re
 
 from lib.pipelines.pipe import pipe
 from lib.xml_tool_stream_adapter_v3 import XmlToolStreamAdapter
@@ -28,6 +29,9 @@ from traceback import format_exc
 print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
 print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
 print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+HYBRID_COMMA_RE = re.compile(r'/>\s*,\s*<')
+TRAILING_COMMA_RE = re.compile(r'(/>),\s*$')
 
 
 
@@ -58,6 +62,9 @@ def _init_state(state: Dict[str, Any], context):
     state['output_pieces'] = []
     state['speak_json_open'] = False
     state['last_spoken_len'] = 0
+    state['hybrid_mode'] = False
+    state['hybrid_bracket_stripped'] = False
+    state['prev_chunk_tail'] = ''
 
     emit_chars = 8
     if context is not None and hasattr(context, 'agent') and context.agent:
@@ -106,6 +113,7 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     Takes {'chunk': text, 'finish': bool}, returns {'chunk': modified_text}.
 
     - Raw text outside XML tags becomes [{"speak": {"text": "..."}}]
+    - Raw text outside XML tags becomes [{\"speak\": {\"text\": \"...\"}}]
     - Tool tags become their JSON command equivalents
     - If the stream starts with '[' or '{', assumes JSON and passes through
     - No side effects: all output is text that the parser handles
@@ -126,7 +134,22 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     # Format detection on first real chunk
     if 'mode' not in state and not finish:
         stripped = chunk.lstrip()
-        if stripped.startswith('[') or stripped.startswith('{'):
+        if stripped.startswith('['):
+            # Check if content inside brackets is XML (hybrid format: [<tag .../>])
+            after_bracket = stripped[1:].lstrip()
+            if after_bracket.startswith('<'):
+                # Hybrid format: JSON array brackets wrapping XML tags
+                print("hybrid xml mode")
+                _init_state(state, context)
+                state['hybrid_mode'] = True
+                # Strip the leading [ and whitespace after it
+                bracket_idx = chunk.find('[')
+                chunk = chunk[bracket_idx + 1:].lstrip('\n ')
+                state['hybrid_bracket_stripped'] = True
+            else:
+                state['mode'] = 'json'
+                print("json mode")
+        elif stripped.startswith('{'):
             state['mode'] = 'json'
             print("json mode")
         else:
@@ -136,6 +159,36 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     if state.get('mode') == 'json':
         print('xml: state is json')
         return data
+
+    # Hybrid mode: clean XML-inside-JSON-array format before feeding to adapter
+    if state.get('hybrid_mode'):
+        # Handle cross-chunk commas: if prev chunk ended with /> and this one starts with ,
+        prev_tail = state.get('prev_chunk_tail', '')
+        if prev_tail.rstrip().endswith('>') and chunk.lstrip().startswith(','):
+            # Strip the leading comma and whitespace
+            chunk = chunk.lstrip()
+            if chunk.startswith(','):
+                chunk = chunk[1:].lstrip('\n ')
+
+        # Also handle: prev chunk ended with comma (after />), current starts with <
+        if prev_tail.rstrip().endswith(',') and chunk.lstrip().startswith('<'):
+            # The comma was a JSON array separator - skip leading whitespace
+            chunk = chunk.lstrip('\n ')
+
+        # Strip trailing commas after /> (JSON array separators at end of chunk)
+        chunk = TRAILING_COMMA_RE.sub(r'\1', chunk)
+
+        # Handle within-chunk commas between tags: />, < -> />\n<
+        chunk = HYBRID_COMMA_RE.sub('/>\n<', chunk)
+
+        # Strip trailing ] on finish
+        if finish:
+            chunk = chunk.rstrip()
+            if chunk.endswith(']'):
+                chunk = chunk[:-1].rstrip()
+
+        # Save tail for next chunk's cross-chunk comma detection
+        state['prev_chunk_tail'] = chunk[-20:] if len(chunk) > 20 else chunk
 
     adapter = state.get('adapter')
     if adapter is None:
@@ -174,8 +227,7 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
 
 # ── System message docstring conversion ──────────────────────────────────
 
-from lib.xml_docstring_adapter import convert_docstring_json_examples_to_xml
-
+from lib.xml_docstring_adapter import convert_docstring_json_examples_to_xml, convert_system_message_for_xml
 
 # Cache: maps original system message text (minus datetime) to converted text.
 # Avoids re-converting the same docstrings every turn when only the datetime changed.
@@ -212,8 +264,7 @@ async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str
     if cached is not None:
         return {'text': cached}
 
-    converted = convert_docstring_json_examples_to_xml(text)
-
+    converted = convert_system_message_for_xml(text)
     print("proc sys msg: converting doc string examples:",len(text))
     
     # Cache the result
