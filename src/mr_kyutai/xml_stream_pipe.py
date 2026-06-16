@@ -22,6 +22,14 @@ from typing import Any, Dict
 from lib.pipelines.pipe import pipe
 from lib.xml_tool_stream_adapter_v3 import XmlToolStreamAdapter
 
+print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
+print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
+print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+
+
+print("top of mr_kyutai!!")
+
 
 def _xml_enabled(context) -> bool:
     """Check if XML streaming mode is enabled."""
