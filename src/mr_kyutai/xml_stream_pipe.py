@@ -136,6 +136,7 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     if 'mode' not in state and state.get('pending_prefix') and not finish:
         prefix = state.pop('pending_prefix')
         combined = prefix + chunk
+        print(f"xml HYBRID: deferred detection resolved, combined {len(prefix)}+{len(chunk)} chars")
         # Re-run format detection on the combined text
         chunk = combined
         # Fall through to normal detection below with the combined chunk
@@ -150,12 +151,15 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
             if not after_bracket:
                 # First chunk is just [ with whitespace - defer detection
                 # Buffer the prefix and wait for next chunk
+            if not after_bracket:
                 state['pending_prefix'] = chunk
                 print("xml: deferring format detection, buffering prefix")
+                print(f"xml HYBRID: first chunk is just '[', deferring detection")
                 return {'chunk': ''}
             elif after_bracket.startswith('<'):
                 # Hybrid format: JSON array brackets wrapping XML tags
                 print("hybrid xml mode")
+                print(f"xml HYBRID: detected [<tag/>] format, entering hybrid mode")
                 _init_state(state, context)
                 state['hybrid_mode'] = True
                 # Strip the leading [ and whitespace after it
@@ -165,11 +169,14 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
             else:
                 state['mode'] = 'json'
                 print("json mode")
+                print(f"xml HYBRID: starts with [ but content is not <tag, entering json passthrough")
         elif stripped.startswith('{'):
             state['mode'] = 'json'
             print("json mode")
+            print("xml HYBRID: starts with {, entering json passthrough")
         else:
             print('init state xml')
+            print(f"xml HYBRID: starts with '{stripped[:20]}', entering pure xml mode")
             _init_state(state, context)
 
     if state.get('mode') == 'json':
@@ -178,6 +185,7 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
 
     # Hybrid mode: clean XML-inside-JSON-array format before feeding to adapter
     if state.get('hybrid_mode'):
+        print(f"xml HYBRID: cleaning chunk ({len(chunk)} chars): {repr(chunk[:80])}...")
         # Handle cross-chunk commas: if prev chunk ended with /> and this one starts with ,
         prev_tail = state.get('prev_chunk_tail', '')
         if prev_tail.rstrip().endswith('>') and chunk.lstrip().startswith(','):
@@ -196,6 +204,8 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
 
         # Handle within-chunk commas between tags: />, < -> />\n<
         chunk = HYBRID_COMMA_RE.sub('/>\n<', chunk)
+
+        print(f"xml HYBRID: cleaned chunk ({len(chunk)} chars): {repr(chunk[:80])}...")
 
         # Strip trailing ] on finish
         if finish:
@@ -282,6 +292,17 @@ async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str
 
     converted = convert_system_message_for_xml(text)
     print("proc sys msg: converting doc string examples:",len(text))
+    print(f"xml SYSMSG: converted system message ({len(text)} -> {len(converted)} chars)")
+    # Show a snippet of the conversion
+    if converted != text:
+        # Find first difference
+        for i, (a, b) in enumerate(zip(text, converted)):
+            if a != b:
+                print(f"xml SYSMSG: first diff at char {i}: original={repr(text[max(0,i-10):i+30])} -> converted={repr(converted[max(0,i-10):i+30])}")
+                break
+        else:
+            if len(text) != len(converted):
+                print(f"xml SYSMSG: texts differ in length ({len(text)} vs {len(converted)})")
     
     # Cache the result
     _sysmsg_cache[cache_key] = converted
