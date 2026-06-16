@@ -65,6 +65,7 @@ def _init_state(state: Dict[str, Any], context):
     state['hybrid_mode'] = False
     state['hybrid_bracket_stripped'] = False
     state['prev_chunk_tail'] = ''
+    state['pending_prefix'] = ''  # buffered content before format is determined
 
     emit_chars = 8
     if context is not None and hasattr(context, 'agent') and context.agent:
@@ -131,13 +132,28 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
 
     state = context.data.setdefault('_xml_stream_state', {})
 
+    # Handle deferred format detection FIRST: we buffered a [ prefix, now we have content
+    if 'mode' not in state and state.get('pending_prefix') and not finish:
+        prefix = state.pop('pending_prefix')
+        combined = prefix + chunk
+        # Re-run format detection on the combined text
+        chunk = combined
+        # Fall through to normal detection below with the combined chunk
+        print(f"xml: re-running detection with combined chunk ({len(chunk)} chars)")
+
     # Format detection on first real chunk
     if 'mode' not in state and not finish:
         stripped = chunk.lstrip()
         if stripped.startswith('['):
             # Check if content inside brackets is XML (hybrid format: [<tag .../>])
             after_bracket = stripped[1:].lstrip()
-            if after_bracket.startswith('<'):
+            if not after_bracket:
+                # First chunk is just [ with whitespace - defer detection
+                # Buffer the prefix and wait for next chunk
+                state['pending_prefix'] = chunk
+                print("xml: deferring format detection, buffering prefix")
+                return {'chunk': ''}
+            elif after_bracket.startswith('<'):
                 # Hybrid format: JSON array brackets wrapping XML tags
                 print("hybrid xml mode")
                 _init_state(state, context)
