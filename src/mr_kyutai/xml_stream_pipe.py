@@ -149,9 +149,6 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
             # Check if content inside brackets is XML (hybrid format: [<tag .../>])
             after_bracket = stripped[1:].lstrip()
             if not after_bracket:
-                # First chunk is just [ with whitespace - defer detection
-                # Buffer the prefix and wait for next chunk
-            if not after_bracket:
                 state['pending_prefix'] = chunk
                 print("xml: deferring format detection, buffering prefix")
                 print(f"xml HYBRID: first chunk is just '[', deferring detection")
