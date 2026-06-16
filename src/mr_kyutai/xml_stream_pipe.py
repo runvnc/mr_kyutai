@@ -180,10 +180,13 @@ async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str
     Only runs when xml_streaming is enabled. Fast passthrough otherwise.
     Caches by message content (minus datetime) to avoid re-converting every turn.
     """
+    print("<<>>> process system message")
     if not _xml_enabled(context):
+        print("no sys msg processing")
         return data
 
     text = data.get('text', '')
+    print("pip found but no text!")
     if not text:
         return data
 
@@ -191,10 +194,13 @@ async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str
     cache_key = _strip_datetime(text)
     cached = _sysmsg_cache.get(cache_key)
     if cached is not None:
+        print("nothing found in proc sys msg cache")
         return {'text': cached}
 
     converted = convert_docstring_json_examples_to_xml(text)
 
+    print("proc sys msg: converting doc string examples:",len(text))
+    
     # Cache the result
     _sysmsg_cache[cache_key] = converted
     if len(_sysmsg_cache) > _SYSMSG_CACHE_MAX:
