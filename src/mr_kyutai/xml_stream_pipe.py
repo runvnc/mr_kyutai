@@ -132,7 +132,10 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
 
     state = context.data.setdefault('_xml_stream_state', {})
 
-    # Handle deferred format detection FIRST: we buffered a [ prefix, now we have content
+    # Handle deferred format detection FIRST: we buffered leading whitespace
+    # and/or a "[" prefix, now we have content.  Important: if this resolves to
+    # JSON passthrough we must return the *combined* chunk, not the original
+    # data, otherwise a split first "[" is dropped and normal JSON arrays break.
     if 'mode' not in state and state.get('pending_prefix') and not finish:
         prefix = state.pop('pending_prefix')
         combined = prefix + chunk
@@ -145,7 +148,15 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     # Format detection on first real chunk
     if 'mode' not in state and not finish:
         stripped = chunk.lstrip()
-        if stripped.startswith('['):
+        if not stripped:
+            # Providers often send a leading "\n" or spaces before the JSON
+            # command array.  Do not classify that as pure XML/speech yet.
+            # Buffer it and wait for a non-whitespace token so normal JSON mode
+            # still works when MR_XML_STREAMING=1.
+            state['pending_prefix'] = state.get('pending_prefix', '') + chunk
+            print("xml: deferring format detection, buffering leading whitespace")
+            return {'chunk': ''}
+        elif stripped.startswith('['):
             # Check if content inside brackets is XML (hybrid format: [<tag .../>])
             after_bracket = stripped[1:].lstrip()
             if not after_bracket:
@@ -178,7 +189,7 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
 
     if state.get('mode') == 'json':
         print('xml: state is json')
-        return data
+        return {'chunk': chunk, 'finish': finish}
 
     # Hybrid mode: clean XML-inside-JSON-array format before feeding to adapter
     if state.get('hybrid_mode'):
@@ -199,12 +210,22 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
         # Strip trailing commas after /> (JSON array separators at end of chunk)
         chunk = TRAILING_COMMA_RE.sub(r'\1', chunk)
 
-        # Handle within-chunk commas between tags: />, < -> />\n<
-        chunk = HYBRID_COMMA_RE.sub('/>\n<', chunk)
+        # Handle within-chunk commas between tags: />, < -> /><
+        # Do not insert a newline here: in hybrid array mode that newline is only
+        # a separator, and the XML adapter would otherwise speak it.
+        chunk = HYBRID_COMMA_RE.sub('/><', chunk)
+
+        # Strip the closing JSON-array bracket for hybrid [<xml/>] output.  It
+        # often arrives in the same chunk as the final tag, not only in the
+        # explicit finish flush; if left in place the XML adapter speaks it as
+        # literal text and emits a bogus speak("]") command.
+        rstripped = chunk.rstrip()
+        if rstripped.endswith(']'):
+            chunk = rstripped[:-1].rstrip()
 
         print(f"xml HYBRID: cleaned chunk ({len(chunk)} chars): {repr(chunk[:80])}...")
 
-        # Strip trailing ] on finish
+        # Defensive: also strip trailing ] on finish if it arrived separately.
         if finish:
             chunk = chunk.rstrip()
             if chunk.endswith(']'):
