@@ -22,6 +22,9 @@ from typing import Any, Dict
 from lib.pipelines.pipe import pipe
 from lib.xml_tool_stream_adapter_v3 import XmlToolStreamAdapter
 
+# need stack trace str
+from traceback import format_exc
+
 print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
 print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
 print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
@@ -111,9 +114,11 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     finish = data.get('finish', False)
 
     if not _xml_enabled(context):
+        print("xml enabled is false for this context!!!")
         return data
 
     if context is None:
+        print("xml: no context!")
         return data
 
     state = context.data.setdefault('_xml_stream_state', {})
@@ -123,23 +128,31 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
         stripped = chunk.lstrip()
         if stripped.startswith('[') or stripped.startswith('{'):
             state['mode'] = 'json'
+            print("json mode")
         else:
+            print('init state xml')
             _init_state(state, context)
 
     if state.get('mode') == 'json':
+        print('xml: state is json')
         return data
 
     adapter = state.get('adapter')
     if adapter is None:
+        print('xml:no adapter')
         return data
 
     try:
         if finish:
+            print('xml: finish')
             adapter.finish()
         else:
+            print('xml: feed *',chunk,'*')
             adapter.feed(chunk)
-    except Exception:
+    except Exception as e:
         # If adapter blows up, fall back to passthrough
+        trace = format_exc()
+        print('xml: error in adapter', (str(e) + trace))
         return data
 
     # Close any open speak command on finish
@@ -148,10 +161,14 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
         state['speak_json_open'] = False
 
     output = ''.join(state['output_pieces'])
+    print("xml output pieces", output)
     state['output_pieces'] = []
 
     if output:
+        print('returning chunk', output)
         return {'chunk': output}
+
+    print('returning empty string')
     return {'chunk': ''}
 
 
@@ -186,7 +203,6 @@ async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str
         return data
 
     text = data.get('text', '')
-    print("pip found but no text!")
     if not text:
         return data
 
@@ -194,7 +210,6 @@ async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str
     cache_key = _strip_datetime(text)
     cached = _sysmsg_cache.get(cache_key)
     if cached is not None:
-        print("nothing found in proc sys msg cache")
         return {'text': cached}
 
     converted = convert_docstring_json_examples_to_xml(text)
