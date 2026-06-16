@@ -80,10 +80,21 @@ def _init_state(state: Dict[str, Any], context):
             delta = text[old_len:]
             if not delta:
                 return
+
+            # XML models often format tool-only responses with leading/trailing
+            # newlines or spaces, e.g. "\n\n<call .../>".  The adapter treats
+            # text outside tags as speech and force-flushes before a tool, so
+            # without this guard formatting whitespace becomes a bogus
+            # speak("\n\n") command.  Advance our cursor so later real speech
+            # does not replay the ignored whitespace.
+            if not text.strip():
+                state['last_spoken_len'] = new_len
+                return
+
             if not state['speak_json_open']:
                 # Start a new speak command as partial JSON
                 state['output_pieces'].append('[{"speak": {"text": "')
-                state['output_pieces'].append(_json_str_content(text))
+                state['output_pieces'].append(_json_str_content(delta))
                 state['speak_json_open'] = True
             else:
                 # Continue the existing speak command with just the delta
