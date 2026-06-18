@@ -1,4 +1,4 @@
-"""
+\"\"\"
 process_stream pipe for mr_kyutai: transforms XML-ish LLM output into JSON
 command arrays that feed into the normal parse_cmd_stream parser.
 
@@ -13,7 +13,7 @@ Activation:
     - Environment: MR_XML_STREAMING=1
 
 No side effects: all output is text (JSON arrays) that the parser handles.
-"""
+\"\"\"
 
 import json
 import os
@@ -125,7 +125,6 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     Takes {'chunk': text, 'finish': bool}, returns {'chunk': modified_text}.
 
     - Raw text outside XML tags becomes [{"speak": {"text": "..."}}]
-    - Raw text outside XML tags becomes [{\"speak\": {\"text\": \"...\"}}]
     - Tool tags become their JSON command equivalents
     - If the stream starts with '[' or '{', assumes JSON and passes through
     - No side effects: all output is text that the parser handles
@@ -280,7 +279,7 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     return {'chunk': ''}
 
 
-# ── System message docstring conversion ──────────────────────────────────
+# ── System message docstring conversion ──────────────────────────────────────
 
 from lib.xml_docstring_adapter import convert_docstring_json_examples_to_xml, convert_system_message_for_xml
 
@@ -296,49 +295,133 @@ def _strip_datetime(text: str) -> str:
     return re.sub(r'^~ \d{4}-\d{2}-\d{2}.*$', '', text, flags=re.MULTILINE).strip()
 
 
+def _build_clean_system_message(data: Dict[str, Any]) -> str:
+    """Build a clean, minimal system message from the render data dict.
+
+    This replaces the bloated system.jinja2 output with a compact message
+    suitable for XML streaming mode with small voice models.
+    """
+    parts = []
+
+    # Datetime
+    formatted_dt = data.get('formatted_datetime', '')
+    if formatted_dt:
+        parts.append(f'Current System Date: {formatted_dt}')
+        parts.append('')
+
+    # Context data
+    context_data = data.get('context_data', {})
+    if context_data:
+        parts.append('## Context Data')
+        for key in context_data:
+            parts.append(f'{key}: {context_data[key]}')
+        parts.append('')
+
+    # Agent info
+    agent = data.get('agent', {})
+    persona = data.get('persona', {})
+
+    if agent.get('name'):
+        parts.append(f'# Agent: {agent["name"]}')
+        model = agent.get('service_models', {}).get('stream_chat', '')
+        if model:
+            parts.append(f'Model: {model}')
+        parts.append('')
+
+    # Persona
+    if persona:
+        parts.append('# Persona')
+        if persona.get('name'):
+            parts.append(f'You are {persona["name"]}.')
+        if persona.get('description'):
+            parts.append(persona['description'])
+        if persona.get('appearance'):
+            parts.append(f'Appearance: {persona["appearance"]}')
+        if persona.get('behavior'):
+            parts.append(f'Behavior: {persona["behavior"]}')
+        if persona.get('speech_patterns'):
+            parts.append(f'Speech: {persona["speech_patterns"]}')
+        parts.append('')
+
+    # Agent instructions
+    if agent.get('instructions'):
+        parts.append('# Instructions')
+        parts.append(agent['instructions'])
+        parts.append('')
+
+    # Available commands with docstrings converted to XML
+    command_docs = data.get('command_docs', {})
+    if command_docs:
+        parts.append('# Available Commands')
+        parts.append('')
+        for cmd_name, docstring in command_docs.items():
+            converted = convert_docstring_json_examples_to_xml(docstring or '')
+            parts.append(f'{cmd_name}: {converted}')
+        parts.append('')
+
+    # Brief output format instructions for XML streaming
+    parts.append('# Output Format')
+    parts.append('Respond using XML tool tags. Raw text outside tags is spoken aloud.')
+    parts.append('Examples:')
+    parts.append('  <speak text="Hello there"/>')
+    parts.append('  <wait_for_user_reply text="How can I help?"/>')
+    parts.append('Multiple commands can be output at once. Wait for command results before issuing dependent commands.')
+    parts.append('')
+
+    return '\n'.join(parts)
+
+
 @pipe(name='process_system_message', priority=5)
 async def process_system_message(data: Dict[str, Any], context=None) -> Dict[str, Any]:
-    """Convert JSON examples to XML-ish syntax in the system message when xml_streaming is on.
+    """Rebuild a clean, minimal system message for XML streaming mode.
 
-    Takes {'text': system_message}, returns {'text': modified_system_message}.
+    Takes {'text': system_message, 'data': render_data}, returns {'text': clean_system_message}.
     Only runs when xml_streaming is enabled. Fast passthrough otherwise.
-    Caches by message content (minus datetime) to avoid re-converting every turn.
+    When 'data' is available, rebuilds from scratch instead of regex-patching the bloated template.
     """
     print("<<>>> process system message")
     if not _xml_enabled(context):
         print("no sys msg processing")
         return data
 
+    render_data = data.get('data')
+    if render_data:
+        # Build a clean system message from the raw data dict
+        cache_key = _strip_datetime(render_data.get('formatted_datetime', ''))
+        global _sysmsg_cache
+        cached = _sysmsg_cache.get(cache_key)
+        if cached is not None:
+            return {'text': cached}
+
+        clean_msg = _build_clean_system_message(render_data)
+        print(f"xml SYSMSG: rebuilt clean system message ({len(clean_msg)} chars)")
+
+        _sysmsg_cache[cache_key] = clean_msg
+        if len(_sysmsg_cache) > _SYSMSG_CACHE_MAX:
+            keys = list(_sysmsg_cache.keys())
+            for k in keys[:_SYSMSG_CACHE_MAX // 2]:
+                del _sysmsg_cache[k]
+
+        return {'text': clean_msg}
+
+    # Fallback: if no data dict, use the old regex conversion approach
     text = data.get('text', '')
     if not text:
         return data
 
-    global _sysmsg_cache
     cache_key = _strip_datetime(text)
     cached = _sysmsg_cache.get(cache_key)
     if cached is not None:
         return {'text': cached}
 
     converted = convert_system_message_for_xml(text)
-    print("proc sys msg: converting doc string examples:",len(text))
-    print(f"xml SYSMSG: converted system message ({len(text)} -> {len(converted)} chars)")
-    # Show a snippet of the conversion
-    if converted != text:
-        # Find first difference
-        for i, (a, b) in enumerate(zip(text, converted)):
-            if a != b:
-                print(f"xml SYSMSG: first diff at char {i}: original={repr(text[max(0,i-10):i+30])} -> converted={repr(converted[max(0,i-10):i+30])}")
-                break
-        else:
-            if len(text) != len(converted):
-                print(f"xml SYSMSG: texts differ in length ({len(text)} vs {len(converted)})")
-    
+    print(f"xml SYSMSG: fallback regex conversion ({len(text)} -> {len(converted)} chars)")
+
     # Cache the result
     _sysmsg_cache[cache_key] = converted
     if len(_sysmsg_cache) > _SYSMSG_CACHE_MAX:
         keys = list(_sysmsg_cache.keys())
         for k in keys[:_SYSMSG_CACHE_MAX // 2]:
-           del _sysmsg_cache[k]
+            del _sysmsg_cache[k]
 
     return {'text': converted}
- 
