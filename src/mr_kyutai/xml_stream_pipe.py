@@ -1,4 +1,4 @@
-\"\"\"
+"""
 process_stream pipe for mr_kyutai: transforms XML-ish LLM output into JSON
 command arrays that feed into the normal parse_cmd_stream parser.
 
@@ -13,7 +13,7 @@ Activation:
     - Environment: MR_XML_STREAMING=1
 
 No side effects: all output is text (JSON arrays) that the parser handles.
-\"\"\"
+"""
 
 import json
 import os
@@ -279,7 +279,7 @@ async def process_stream(data: Dict[str, Any], context=None) -> Dict[str, Any]:
     return {'chunk': ''}
 
 
-# ── System message docstring conversion ──────────────────────────────────────
+# ── System message docstring conversion ──────────────────────────────
 
 from lib.xml_docstring_adapter import convert_docstring_json_examples_to_xml, convert_system_message_for_xml
 
