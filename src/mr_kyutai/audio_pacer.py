@@ -27,6 +27,7 @@ class AudioPacer:
         self.audio_start_time: Optional[float] = None
         self._finished_adding = False
         self._interrupted = False
+        self._resume = False
 
     async def add_chunk(self, audio_bytes: bytes):
         if self._running and not self._interrupted:
@@ -70,6 +71,7 @@ class AudioPacer:
         self.start_time = time.perf_counter()
         self.bytes_sent = 0
         self.audio_start_time = None
+        self._resume = False
 
         self.pacer_task = asyncio.create_task(self._pace_loop())
 
@@ -79,6 +81,18 @@ class AudioPacer:
                 break
             if len(self.buffer) > 0:
                 chunk = self.buffer.popleft()
+
+                # Re-anchor the timing clock to wall-clock time whenever audio
+                # resumes after the buffer went idle (or on the very first
+                # chunk). Without this, chunk_timestamp only advances by the
+                # amount of audio actually sent, so any wall-clock pause between
+                # utterances (e.g. LLM think latency) is collapsed -- making the
+                # recording show outgoing speech starting instantly after the
+                # caller stops, and causing a burst-to-catch-up on RTP output.
+                if self.audio_start_time is None or self._resume:
+                    self.audio_start_time = time.perf_counter()
+                    self.bytes_sent = 0
+                    self._resume = False
 
                 if self.audio_start_time:
                     chunk_timestamp = self.audio_start_time + (self.bytes_sent / self.sample_rate)
@@ -108,6 +122,7 @@ class AudioPacer:
             else:
                 if self._finished_adding:
                     break
+                self._resume = True
                 await asyncio.sleep(0.005)
 
         logger.debug(f"AudioPacer: finished, sent {self.bytes_sent} bytes")
