@@ -1,6 +1,5 @@
 from typing import Optional, Dict, Any
 import logging
-from . import xml_stream_pipe  # registers @pipe(name='process_stream')
 
 print("Loading Kyutai")
  
@@ -40,6 +39,7 @@ async def speak(
                 cleanup_session,
                 is_realtime_streaming_enabled,
                 get_speak_serial_lock,
+                is_barge_in_pending,
                 _klog,
             )
 
@@ -55,6 +55,23 @@ async def speak(
             lock = get_speak_serial_lock(log_id)
             await lock.acquire()
             acquired_lock = True
+            # Barge-in guard: if the user interrupted (on_interrupt set the
+            # barge-in marker) while we were created/queued, do NOT create a
+            # fresh session or drain audio over the user. on_interrupt already
+            # request_cancel'd any live session; just ensure cleanup and bail.
+            # We intentionally do NOT consume the marker here — the next
+            # response's first partial_command consumes it when it starts the
+            # new session.
+            if is_barge_in_pending(log_id):
+                _klog(f"speak() command: barge-in pending, skipping audio for log_id={log_id}")
+                existing = _realtime_sessions.get(log_id)
+                if existing is not None:
+                    try:
+                        existing.request_cancel()
+                    except Exception:
+                        pass
+                    await cleanup_session(log_id, session=existing)
+                return None
             s = _realtime_sessions.get(log_id)
             if s is None:
                 # Important completion-barrier case:
