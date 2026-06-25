@@ -32,8 +32,13 @@ class AudioPacer:
     async def add_chunk(self, audio_bytes: bytes):
         if self._running and not self._interrupted:
             self.buffer.append(audio_bytes)
-            if self.audio_start_time is None:
-                self.audio_start_time = time.perf_counter()
+            # NOTE: do NOT anchor audio_start_time here. Buffering happens as
+            # soon as the TTS engine produces audio, which on a cold/first call
+            # can be well before the pace loop actually starts sending (engine
+            # warmup, event-loop contention). Anchoring at buffer time makes the
+            # recording place the whole turn ~that-delay too early (turn looks
+            # "instant" while the caller really waited ~1s). The pace loop sets
+            # audio_start_time at the moment the first frame is actually sent.
 
     @property
     def interrupted(self) -> bool:
