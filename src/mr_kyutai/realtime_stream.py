@@ -61,7 +61,7 @@ try:
     _file_logger = logging.getLogger('mr_kyutai.realtime')
     _file_logger.addHandler(_fh)
     _file_logger.setLevel(logging.DEBUG)
-    _file_logger.propagate = True
+    _file_logger.propagate = False
 except Exception:
     pass
 
